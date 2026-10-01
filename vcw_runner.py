@@ -622,24 +622,32 @@ class SSHBackend:
         t = self.connect().get_transport()
         return {"ok": bool(t and t.is_active()), "port": self.cfg.target_port, "connection_generation": self.generation}
 
-    def canonical(self, sftp, path: str, allow_missing: bool = False) -> str:
-        lexical = self.policy.path(path)
+    def canonical(self, sftp, path: str, allow_missing: bool = False, allow_control: bool = False) -> str:
+        validate = self.policy.path if allow_control else self.policy.user_path
+        lexical = validate(path)
         try:
             canonical = sftp.normalize(lexical)
-            self.policy.path(canonical)
-            return canonical
+            return validate(canonical)
         except OSError:
             if not allow_missing:
                 raise
-            parent = sftp.normalize(posixpath.dirname(lexical))
-            self.policy.path(parent)
-            return self.policy.path(posixpath.join(parent, posixpath.basename(lexical)))
+            parent = validate(sftp.normalize(posixpath.dirname(lexical)))
+            return validate(posixpath.join(parent, posixpath.basename(lexical)))
 
     def canonical_existing_path(self, path: str) -> str:
         with self.lock:
             try:
                 with self.connect().open_sftp() as sftp:
                     return self.canonical(sftp, path)
+            except socket.timeout as exc:
+                self.reset()
+                raise BackendTimeout("SFTP path resolution timed out") from exc
+
+    def canonical_user_target(self, path: str) -> str:
+        with self.lock:
+            try:
+                with self.connect().open_sftp() as sftp:
+                    return self.canonical(sftp, path, allow_missing=True)
             except socket.timeout as exc:
                 self.reset()
                 raise BackendTimeout("SFTP path resolution timed out") from exc
@@ -665,17 +673,17 @@ class SSHBackend:
                 self.reset()
                 raise BackendTimeout("SFTP read timed out") from exc
 
-    def write_bytes_cas(self, path: str, data: bytes, expected_sha256: str | None) -> dict[str, Any]:
+    def write_bytes_cas(self, path: str, data: bytes, expected_sha256: str | None, *, allow_control: bool = False) -> dict[str, Any]:
         if len(data) > self.cfg.max_file_bytes:
             raise PolicyError("payload exceeds VCW_MAX_FILE_BYTES")
         with self.lock:
             rename_attempted = False
             try:
                 with self.connect().open_sftp() as sftp:
-                    lexical = self.policy.path(path)
-                    parent = sftp.normalize(posixpath.dirname(lexical))
-                    self.policy.path(parent)
-                    remote = self.policy.path(posixpath.join(parent, posixpath.basename(lexical)))
+                    validate = self.policy.path if allow_control else self.policy.user_path
+                    lexical = validate(path)
+                    parent = validate(sftp.normalize(posixpath.dirname(lexical)))
+                    remote = validate(posixpath.join(parent, posixpath.basename(lexical)))
                     current_sha = None
                     current_mode = None
                     try:
@@ -965,6 +973,8 @@ class RunnerService:
     def rpc_apply_patch(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         patch = p.get("patch")
         touched = self.policy.patch_paths(patch)
+        for touched_path in touched:
+            self.backend.canonical_user_target(touched_path)
         data = patch.encode()
         rel = f".vcw-runner/tmp/{rid}.patch"
         remote = self.policy.path(rel)
@@ -973,7 +983,7 @@ class RunnerService:
             raise BackendFailure("cannot create patch temp directory")
 
         try:
-            self.backend.write_bytes_cas(remote, data, None)
+            self.backend.write_bytes_cas(remote, data, None, allow_control=True)
             check = self.backend.exec_argv(["git", "apply", "--check", rel], self.cfg.project_root)
             if check.exit_code != 0:
                 return self.response(
