@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import threading
 import time
@@ -30,7 +31,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _authorized(self) -> bool:
-        return self.headers.get("Authorization", "") == f"Bearer {CFG.runner_token}"
+        return hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {CFG.runner_token}")
 
     def do_GET(self):
         if self.path == "/health":
