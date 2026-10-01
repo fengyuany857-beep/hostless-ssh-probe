@@ -337,7 +337,10 @@ class SSHBackend:
         with self.lock:
             try:
                 with self.connect().open_sftp() as sftp:
-                    remote = self.canonical(sftp, path, allow_missing=True)
+                    lexical = self.policy.path(path)
+                    parent = sftp.normalize(posixpath.dirname(lexical))
+                    self.policy.path(parent)
+                    remote = self.policy.path(posixpath.join(parent, posixpath.basename(lexical)))
                     current_sha = None
                     try:
                         attrs = sftp.lstat(remote)
