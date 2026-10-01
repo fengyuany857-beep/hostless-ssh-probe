@@ -76,22 +76,22 @@ The RPC never accepts a host, port or username from the caller.
 
 Optional `session_id` is correlation-only metadata supplied by Gateway. Runner does not use it as authorization or session lease authority. Unknown envelope and method-parameter fields are denied rather than silently ignored.
 
-For side effects, `request_id` is bound to a canonical fingerprint of fixed server identity + method + params. Reusing it with changed action semantics is denied.
+For side effects, `request_id` is bound to a canonical fingerprint of fixed server identity + method + params. Reusing it with changed action semantics is denied. Existing incomplete claims are never re-executed. The ledger stores only minimal reconciliation hints such as desired file SHA/path or deterministic job id, not task state or file bodies.
 
 ## Security boundary
 
-The target SSH account is part of the isolation model. Runner argv filtering is not a complete host filesystem sandbox. Use a dedicated Unix account whose permissions expose only the intended project and required toolchain.
+The target SSH account is part of the isolation model. Runner argv filtering is not a complete host filesystem sandbox. Use a dedicated Unix account whose permissions expose only the intended project and required toolchain. Runner startup rejects `TARGET_USER=root` and `VCW_PROJECT_ROOT=/`.
 
-Writes support CAS, SFTP temp files, atomic `posix_rename` and read-back SHA256 verification. SSH server identity is pinned with `SSH_HOST_KEY_SHA256`.
+Writes support compare-before-write CAS semantics, SFTP temp files, atomic `posix_rename`, read-back SHA256 verification, and file-mode verification. Existing regular-file mode is preserved; new files default to `0644`. Caller-facing file APIs refuse `.git` and `.vcw-runner` control metadata. SSH server identity is pinned with `SSH_HOST_KEY_SHA256`.
 
 Caller executable paths are not accepted: `argv[0]` must be a bare name in `VCW_ALLOWED_EXEC`, resolved only through deployment-fixed `VCW_EXEC_PATH`. Exec/job cwd is canonically checked against the configured project root. This still does not replace least-privileged target-account isolation.
 
 For production idempotency across Hostless redeploys, link a managed PostgreSQL database and inject its connection string as `VCW_LEDGER_DATABASE_URL`. The Runner stores only request-ledger metadata and serialized RPC responses there. If that variable is absent, the Runner falls back to `VCW_LEDGER_DB` SQLite; the default `/tmp/vcw-runner-ledger.sqlite3` is restart-local and must not be used for a frozen production Runner.
 
-Authenticated `GET /v1/info` reports ledger durability and a SHA256 runtime build fingerprint over packaged Runner source/requirements so real-host evidence can be bound to the deployed build.
+Authenticated `GET /v1/info` reports ledger durability and a SHA256 runtime build fingerprint over packaged Runner source/requirements so real-host evidence can be bound to the deployed build. `connection_generation` is a successful SSH connection epoch and increments once per new established connection.
 
 ## Current status
 
 Hostless -> target VPS TCP/22 reachability has already been proven. This branch upgrades the probe into the formal Runner API implementation.
 
-Before freezing `vcw.runner.v1`, perform real Hostless SSH/SFTP acceptance against the target VPS, including host-key rejection, CAS conflict, timeout/reconnect, job cancel, connection-generation change, transfer integrity and `OUTCOME_UNKNOWN` reconciliation cases.
+Before freezing `vcw.runner.v1`, perform real Hostless SSH/SFTP acceptance against the target VPS, including durable PostgreSQL ledger replay across redeploy, wrong host-key rejection, CAS conflict, mode preservation, timeout/reconnect, job cancellation races, local 429 saturation, audit leak checks, transfer integrity and `OUTCOME_UNKNOWN` reconciliation cases.
