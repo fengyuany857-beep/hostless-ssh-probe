@@ -81,7 +81,7 @@ class Config:
     max_file_bytes: int
     max_output_bytes: int
     max_inflight: int
-    state_db: str
+    ledger_db: str
     port: int
 
     @classmethod
@@ -113,7 +113,7 @@ class Config:
             max_file_bytes=int(os.environ.get("VCW_MAX_FILE_BYTES", str(4 * 1024 * 1024))),
             max_output_bytes=int(os.environ.get("VCW_MAX_OUTPUT_BYTES", str(1024 * 1024))),
             max_inflight=max(1, int(os.environ.get("VCW_MAX_INFLIGHT", "4"))),
-            state_db=os.environ.get("VCW_STATE_DATABASE_URL", "").strip() or os.environ.get("VCW_STATE_DB", "/tmp/vcw-runner.sqlite3"),
+            ledger_db=os.environ.get("VCW_LEDGER_DATABASE_URL", "").strip() or os.environ.get("VCW_LEDGER_DB", "/tmp/vcw-runner-ledger.sqlite3"),
             port=int(os.environ.get("PORT", "8080")),
         )
 
@@ -177,7 +177,7 @@ class Policy:
         return sorted(touched)
 
 
-class OperationStore:
+class IdempotencyLedger:
     POSTGRES_PREFIXES = ("postgresql://", "postgres://")
 
     def __init__(self, target: str):
@@ -191,7 +191,7 @@ class OperationStore:
             try:
                 import psycopg
             except ImportError as exc:
-                raise RuntimeError("psycopg is required for VCW_STATE_DATABASE_URL") from exc
+                raise RuntimeError("psycopg is required for VCW_LEDGER_DATABASE_URL") from exc
             self._psycopg = psycopg
             with self._pg_connect() as conn:
                 conn.execute(
@@ -514,7 +514,7 @@ class RunnerService:
         self.cfg = cfg
         self.policy = Policy(cfg.project_root, cfg.allowed_tools, cfg.allowed_exec)
         self.backend = SSHBackend(cfg, self.policy)
-        self.store = OperationStore(cfg.state_db)
+        self.ledger = IdempotencyLedger(cfg.ledger_db)
 
     def response(self, request_id: str, status: str, result: dict[str, Any] | None = None, code: str | None = None, message: str | None = None) -> dict[str, Any]:
         if status not in STATUSES:
@@ -530,7 +530,7 @@ class RunnerService:
         if not isinstance(params, dict):
             raise PolicyError("params must be an object")
         if method in SIDE_EFFECTS:
-            prior = self.store.begin(request_id, method)
+            prior = self.ledger.begin(request_id, method)
             if prior and prior["response"] is not None:
                 return prior["response"]
             if prior and prior["state"] == "RUNNING":
@@ -546,7 +546,7 @@ class RunnerService:
         except Exception as exc:
             result = self.response(request_id, "FAILED", code=type(exc).__name__, message=str(exc))
         if method in SIDE_EFFECTS:
-            self.store.finish(request_id, result["status"], result)
+            self.ledger.finish(request_id, result["status"], result)
         return result
 
     def rpc_read_file(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
@@ -684,7 +684,7 @@ class RunnerService:
             target = p.get("target_request_id")
             if not isinstance(target, str):
                 raise PolicyError("target_request_id is required")
-            old = self.store.get(target)
+            old = self.ledger.get(target)
             if not old:
                 return self.response(rid, "OUTCOME_UNKNOWN", None, "REQUEST_NOT_FOUND", "no local request record")
             if old["response"]:
