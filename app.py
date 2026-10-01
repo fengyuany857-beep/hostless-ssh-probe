@@ -43,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
                 probe = SERVICE.backend.probe()
                 if self.path == "/probe":
                     return self._json(200, probe)
-                return self._json(200, {"ok": True, "rpc_version": RPC_VERSION, "server_id": CFG.server_id, "connection_generation": SERVICE.backend.generation, "backend": probe, "state_store": {"backend": SERVICE.store.backend, "durable": SERVICE.store.durable}, "tools": sorted(CFG.allowed_tools)})
+                return self._json(200, {"ok": True, "rpc_version": RPC_VERSION, "server_id": CFG.server_id, "connection_generation": SERVICE.backend.generation, "backend": probe, "idempotency_ledger": {"backend": SERVICE.ledger.backend, "durable": SERVICE.ledger.durable}, "tools": sorted(CFG.allowed_tools)})
             except Exception as exc:
                 return self._json(503, {"ok": False, "error": type(exc).__name__, "message": str(exc)})
         return self._json(404, {"ok": False, "error": "not found"})
