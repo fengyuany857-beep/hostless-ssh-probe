@@ -4,6 +4,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import posixpath
 import re
@@ -53,6 +54,28 @@ def _csv(name: str, default: str) -> frozenset[str]:
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def normalize_sha256_hex(value: object, field: str, *, allow_none: bool = False) -> str | None:
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        raise PolicyError(f"{field} must be a SHA256 hex digest" + (" or null" if allow_none else ""))
+    return value.lower()
+
+
+def canonical_request_fingerprint(server_id: str, session_id: str | None, method: str, params: dict[str, Any]) -> str:
+    try:
+        raw = json.dumps(
+            {"server_id": server_id, "session_id": session_id, "method": method, "params": params},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise PolicyError("request contains non-canonical JSON values") from exc
+    return sha256(raw)
 
 
 def normalize_host_key_sha256(value: str) -> str:
@@ -134,6 +157,26 @@ class Policy:
             raise PolicyError(f"tool not allowed: {value}")
         return value
 
+    def check_session_id(self, value: object | None) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not SAFE_ID.fullmatch(value):
+            raise PolicyError("invalid session_id")
+        return value
+
+    def timeout(self, value: object | None) -> float:
+        if value is None:
+            raise PolicyError("timeout_s is required when validating an explicit timeout")
+        if isinstance(value, bool):
+            raise PolicyError("timeout_s must be a finite positive number")
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError) as exc:
+            raise PolicyError("timeout_s must be a finite positive number") from exc
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise PolicyError("timeout_s must be a finite positive number")
+        return min(timeout, 300.0)
+
     def path(self, value: object) -> str:
         if not isinstance(value, str) or not value or "\x00" in value:
             raise PolicyError("invalid path")
@@ -200,9 +243,11 @@ class IdempotencyLedger:
                     "method TEXT NOT NULL,"
                     "state TEXT NOT NULL,"
                     "response_json TEXT,"
-                    "updated_at DOUBLE PRECISION NOT NULL"
+                    "updated_at DOUBLE PRECISION NOT NULL,"
+                    "request_fingerprint TEXT"
                     ")"
                 )
+                conn.execute("ALTER TABLE operations ADD COLUMN IF NOT EXISTS request_fingerprint TEXT")
         else:
             Path(target).parent.mkdir(parents=True, exist_ok=True)
             with self._sqlite_connect() as conn:
@@ -212,9 +257,13 @@ class IdempotencyLedger:
                     "method TEXT NOT NULL,"
                     "state TEXT NOT NULL,"
                     "response_json TEXT,"
-                    "updated_at REAL NOT NULL"
+                    "updated_at REAL NOT NULL,"
+                    "request_fingerprint TEXT"
                     ")"
                 )
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(operations)")}
+                if "request_fingerprint" not in columns:
+                    conn.execute("ALTER TABLE operations ADD COLUMN request_fingerprint TEXT")
 
     def _sqlite_connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.target, timeout=5)
@@ -241,13 +290,14 @@ class IdempotencyLedger:
             "state": row[1],
             "response": json.loads(row[2]) if row[2] else None,
             "updated_at": row[3],
+            "request_fingerprint": row[4],
         }
 
     def get(self, request_id: str) -> dict[str, Any] | None:
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
                 row = conn.execute(
-                    "SELECT method,state,response_json,updated_at "
+                    "SELECT method,state,response_json,updated_at,request_fingerprint "
                     "FROM operations WHERE request_id=%s",
                     (request_id,),
                 ).fetchone()
@@ -255,29 +305,29 @@ class IdempotencyLedger:
 
         with self.lock, self._sqlite_connect() as conn:
             row = conn.execute(
-                "SELECT method,state,response_json,updated_at "
+                "SELECT method,state,response_json,updated_at,request_fingerprint "
                 "FROM operations WHERE request_id=?",
                 (request_id,),
             ).fetchone()
         return self._record(row)
 
-    def begin(self, request_id: str, method: str) -> dict[str, Any] | None:
+    def begin(self, request_id: str, method: str, request_fingerprint: str) -> dict[str, Any] | None:
         now = time.time()
 
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
                 inserted = conn.execute(
-                    "INSERT INTO operations(request_id,method,state,updated_at) "
-                    "VALUES(%s,%s,'RUNNING',%s) "
+                    "INSERT INTO operations(request_id,method,state,updated_at,request_fingerprint) "
+                    "VALUES(%s,%s,'RUNNING',%s,%s) "
                     "ON CONFLICT (request_id) DO NOTHING "
                     "RETURNING request_id",
-                    (request_id, method, now),
+                    (request_id, method, now, request_fingerprint),
                 ).fetchone()
                 if inserted:
                     return None
 
                 row = conn.execute(
-                    "SELECT method,state,response_json,updated_at "
+                    "SELECT method,state,response_json,updated_at,request_fingerprint "
                     "FROM operations WHERE request_id=%s",
                     (request_id,),
                 ).fetchone()
@@ -287,12 +337,16 @@ class IdempotencyLedger:
                 assert record is not None
                 if record["method"] != method:
                     raise PolicyError("request_id already used for another method")
+                if record["request_fingerprint"] is None:
+                    raise PolicyError("request_id refers to a legacy record without request fingerprint; reconcile only")
+                if record["request_fingerprint"] != request_fingerprint:
+                    raise PolicyError("request_id already used for different request parameters")
                 return record
 
         with self.lock, self._sqlite_connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT method,state,response_json,updated_at "
+                "SELECT method,state,response_json,updated_at,request_fingerprint "
                 "FROM operations WHERE request_id=?",
                 (request_id,),
             ).fetchone()
@@ -301,11 +355,15 @@ class IdempotencyLedger:
                 assert record is not None
                 if record["method"] != method:
                     raise PolicyError("request_id already used for another method")
+                if record["request_fingerprint"] is None:
+                    raise PolicyError("request_id refers to a legacy record without request fingerprint; reconcile only")
+                if record["request_fingerprint"] != request_fingerprint:
+                    raise PolicyError("request_id already used for different request parameters")
                 return record
             conn.execute(
-                "INSERT INTO operations(request_id,method,state,updated_at) "
-                "VALUES(?,?,'RUNNING',?)",
-                (request_id, method, now),
+                "INSERT INTO operations(request_id,method,state,updated_at,request_fingerprint) "
+                "VALUES(?,?,'RUNNING',?,?)",
+                (request_id, method, now, request_fingerprint),
             )
         return None
 
@@ -315,19 +373,23 @@ class IdempotencyLedger:
 
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE operations SET state=%s,response_json=%s,updated_at=%s "
                     "WHERE request_id=%s",
                     (status, payload, now, request_id),
                 )
+                if cur.rowcount != 1:
+                    raise RuntimeError("operation ledger terminal update affected no row")
             return
 
         with self.lock, self._sqlite_connect() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE operations SET state=?,response_json=?,updated_at=? "
                 "WHERE request_id=?",
                 (status, payload, now, request_id),
             )
+            if cur.rowcount != 1:
+                raise RuntimeError("operation ledger terminal update affected no row")
 
 
 class PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
@@ -489,7 +551,7 @@ class SSHBackend:
     def exec_argv(self, argv: list[str], cwd: str | None, timeout_s: float | None = None) -> ExecResult:
         argv = self.policy.argv(argv)
         cwd = self.policy.cwd(cwd)
-        timeout = min(float(timeout_s or self.cfg.backend_timeout_s), 300.0)
+        timeout = self.cfg.backend_timeout_s if timeout_s is None else self.policy.timeout(timeout_s)
         command = "cd -- {} && exec {}".format(shlex.quote(cwd), " ".join(shlex.quote(x) for x in argv))
         return self.internal_exec(command, timeout)
 
@@ -528,12 +590,14 @@ class RunnerService:
         request_id = self.policy.check_request_id(body.get("request_id"))
         if body.get("server_id") != self.cfg.server_id:
             raise PolicyError("server_id mismatch")
+        session_id = self.policy.check_session_id(body.get("session_id"))
         method = self.policy.check_tool(body.get("method"))
         params = body.get("params", {})
         if not isinstance(params, dict):
             raise PolicyError("params must be an object")
+        fingerprint = canonical_request_fingerprint(self.cfg.server_id, session_id, method, params)
         if method in SIDE_EFFECTS:
-            prior = self.ledger.begin(request_id, method)
+            prior = self.ledger.begin(request_id, method, fingerprint)
             if prior and prior["response"] is not None:
                 return prior["response"]
             if prior and prior["state"] == "RUNNING":
@@ -548,8 +612,25 @@ class RunnerService:
             result = self.response(request_id, "FAILED", code="BACKEND_FAILURE", message=str(exc))
         except Exception as exc:
             result = self.response(request_id, "FAILED", code=type(exc).__name__, message=str(exc))
+        if session_id is not None:
+            result["session_id"] = session_id
         if method in SIDE_EFFECTS:
-            self.ledger.finish(request_id, result["status"], result)
+            try:
+                self.ledger.finish(request_id, result["status"], result)
+            except Exception as exc:
+                uncertain = self.response(
+                    request_id,
+                    "OUTCOME_UNKNOWN",
+                    {
+                        "observed_action_status": result.get("status"),
+                        "observed_action_result": result.get("result"),
+                    },
+                    "LEDGER_COMMIT_FAILED",
+                    f"action returned but idempotency ledger terminal commit failed: {type(exc).__name__}",
+                )
+                if session_id is not None:
+                    uncertain["session_id"] = session_id
+                return uncertain
         return result
 
     def rpc_read_file(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
