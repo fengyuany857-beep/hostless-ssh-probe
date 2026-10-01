@@ -41,6 +41,10 @@ class BackendFailure(RuntimeError):
     pass
 
 
+class BackendUncertain(RuntimeError):
+    pass
+
+
 def _required(name: str) -> str:
     value = os.environ.get(name, "").strip()
     if not value:
@@ -505,6 +509,7 @@ class SSHBackend:
         if len(data) > self.cfg.max_file_bytes:
             raise PolicyError("payload exceeds VCW_MAX_FILE_BYTES")
         with self.lock:
+            rename_attempted = False
             try:
                 with self.connect().open_sftp() as sftp:
                     lexical = self.policy.path(path)
@@ -516,44 +521,64 @@ class SSHBackend:
                         attrs = sftp.lstat(remote)
                         if stat.S_ISLNK(attrs.st_mode):
                             raise PolicyError("refusing to overwrite symlink")
+                        if attrs.st_size > self.cfg.max_file_bytes:
+                            raise PolicyError("existing file exceeds VCW_MAX_FILE_BYTES")
                         with sftp.open(remote, "rb") as f:
-                            current_sha = sha256(f.read(self.cfg.max_file_bytes + 1))
+                            current = f.read(self.cfg.max_file_bytes + 1)
+                        if len(current) > self.cfg.max_file_bytes:
+                            raise PolicyError("existing file exceeds VCW_MAX_FILE_BYTES")
+                        current_sha = sha256(current)
                     except FileNotFoundError:
                         pass
                     except OSError as exc:
                         if getattr(exc, "errno", None) != 2:
                             raise
+
                     if expected_sha256 is not None and current_sha != expected_sha256:
                         return {"ok": False, "code": "CAS_MISMATCH", "current_sha256": current_sha}
+
                     tmp = remote + f".vcw-tmp-{uuid.uuid4().hex}"
                     try:
                         with sftp.open(tmp, "wb") as f:
                             f.write(data)
                             f.flush()
-                        sftp.posix_rename(tmp, remote)
-                    except (AttributeError, OSError) as exc:
-                        raise BackendFailure("atomic posix_rename is required") from exc
+                        rename_attempted = True
+                        try:
+                            sftp.posix_rename(tmp, remote)
+                        except AttributeError as exc:
+                            rename_attempted = False
+                            raise BackendFailure("atomic posix_rename is required") from exc
+                        except OSError as exc:
+                            raise BackendUncertain("atomic rename outcome is unknown; reconcile target file") from exc
                     finally:
                         try:
                             sftp.remove(tmp)
                         except OSError:
                             pass
-                    with sftp.open(remote, "rb") as f:
-                        actual = sha256(f.read(self.cfg.max_file_bytes + 1))
+
+                    try:
+                        with sftp.open(remote, "rb") as f:
+                            actual_data = f.read(self.cfg.max_file_bytes + 1)
+                    except Exception as exc:
+                        raise BackendUncertain("write may be applied but readback failed; reconcile target file") from exc
+                    if len(actual_data) > self.cfg.max_file_bytes:
+                        raise BackendUncertain("write target exceeds verification bound after rename")
+                    actual = sha256(actual_data)
                     desired = sha256(data)
                     if actual != desired:
-                        raise BackendFailure("post-write SHA256 verification failed")
+                        raise BackendUncertain("post-write SHA256 verification failed; reconcile target file")
                     return {"ok": True, "sha256": actual, "previous_sha256": current_sha, "bytes": len(data)}
             except socket.timeout as exc:
                 self.reset()
                 raise BackendTimeout("SFTP write timed out") from exc
-
-    def exec_argv(self, argv: list[str], cwd: str | None, timeout_s: float | None = None) -> ExecResult:
-        argv = self.policy.argv(argv)
-        cwd = self.policy.cwd(cwd)
-        timeout = self.cfg.backend_timeout_s if timeout_s is None else self.policy.timeout(timeout_s)
-        command = "cd -- {} && exec {}".format(shlex.quote(cwd), " ".join(shlex.quote(x) for x in argv))
-        return self.internal_exec(command, timeout)
+            except BackendUncertain:
+                self.reset()
+                raise
+            except (EOFError, paramiko.SSHException) as exc:
+                self.reset()
+                if rename_attempted:
+                    raise BackendUncertain("SSH/SFTP connection failed after rename began; reconcile target file") from exc
+                raise BackendFailure("SSH/SFTP write failed before target rename") from exc
 
     def internal_exec(self, command: str, timeout_s: float | None = None) -> ExecResult:
         timeout = float(timeout_s or self.cfg.backend_timeout_s)
@@ -608,6 +633,8 @@ class RunnerService:
             result = self.response(request_id, "DENIED", code="POLICY_DENIED", message=str(exc))
         except BackendTimeout as exc:
             result = self.response(request_id, "OUTCOME_UNKNOWN", code="BACKEND_TIMEOUT", message=str(exc))
+        except BackendUncertain as exc:
+            result = self.response(request_id, "OUTCOME_UNKNOWN", code="BACKEND_OUTCOME_UNKNOWN", message=str(exc))
         except BackendFailure as exc:
             result = self.response(request_id, "FAILED", code="BACKEND_FAILURE", message=str(exc))
         except Exception as exc:
