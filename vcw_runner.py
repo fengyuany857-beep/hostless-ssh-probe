@@ -365,10 +365,12 @@ class IdempotencyLedger:
                     "state TEXT NOT NULL,"
                     "response_json TEXT,"
                     "updated_at DOUBLE PRECISION NOT NULL,"
-                    "request_fingerprint TEXT"
+                    "request_fingerprint TEXT,"
+                    "reconcile_json TEXT"
                     ")"
                 )
                 conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN IF NOT EXISTS request_fingerprint TEXT")
+                conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN IF NOT EXISTS reconcile_json TEXT")
         else:
             Path(target).parent.mkdir(parents=True, exist_ok=True)
             with self._sqlite_connect() as conn:
@@ -379,12 +381,15 @@ class IdempotencyLedger:
                     "state TEXT NOT NULL,"
                     "response_json TEXT,"
                     "updated_at REAL NOT NULL,"
-                    "request_fingerprint TEXT"
+                    "request_fingerprint TEXT,"
+                    "reconcile_json TEXT"
                     ")"
                 )
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(vcw_runner_idempotency_v1)")}
                 if "request_fingerprint" not in columns:
                     conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN request_fingerprint TEXT")
+                if "reconcile_json" not in columns:
+                    conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN reconcile_json TEXT")
 
     def _sqlite_connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.target, timeout=5)
@@ -412,13 +417,14 @@ class IdempotencyLedger:
             "response": json.loads(row[2]) if row[2] else None,
             "updated_at": row[3],
             "request_fingerprint": row[4],
+            "reconcile_hint": json.loads(row[5]) if row[5] else None,
         }
 
     def get(self, request_id: str) -> dict[str, Any] | None:
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
                 row = conn.execute(
-                    "SELECT method,state,response_json,updated_at,request_fingerprint "
+                    "SELECT method,state,response_json,updated_at,request_fingerprint,reconcile_json "
                     "FROM vcw_runner_idempotency_v1 WHERE request_id=%s",
                     (request_id,),
                 ).fetchone()
@@ -426,29 +432,30 @@ class IdempotencyLedger:
 
         with self.lock, self._sqlite_connect() as conn:
             row = conn.execute(
-                "SELECT method,state,response_json,updated_at,request_fingerprint "
+                "SELECT method,state,response_json,updated_at,request_fingerprint,reconcile_json "
                 "FROM vcw_runner_idempotency_v1 WHERE request_id=?",
                 (request_id,),
             ).fetchone()
         return self._record(row)
 
-    def begin(self, request_id: str, method: str, request_fingerprint: str) -> dict[str, Any] | None:
+    def begin(self, request_id: str, method: str, request_fingerprint: str, reconcile_hint: dict[str, Any] | None = None) -> dict[str, Any] | None:
         now = time.time()
+        reconcile_json = None if reconcile_hint is None else json.dumps(reconcile_hint, separators=(",", ":"), sort_keys=True)
 
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
                 inserted = conn.execute(
-                    "INSERT INTO vcw_runner_idempotency_v1(request_id,method,state,updated_at,request_fingerprint) "
-                    "VALUES(%s,%s,'RUNNING',%s,%s) "
+                    "INSERT INTO vcw_runner_idempotency_v1(request_id,method,state,updated_at,request_fingerprint,reconcile_json) "
+                    "VALUES(%s,%s,'RUNNING',%s,%s,%s) "
                     "ON CONFLICT (request_id) DO NOTHING "
                     "RETURNING request_id",
-                    (request_id, method, now, request_fingerprint),
+                    (request_id, method, now, request_fingerprint, reconcile_json),
                 ).fetchone()
                 if inserted:
                     return None
 
                 row = conn.execute(
-                    "SELECT method,state,response_json,updated_at,request_fingerprint "
+                    "SELECT method,state,response_json,updated_at,request_fingerprint,reconcile_json "
                     "FROM vcw_runner_idempotency_v1 WHERE request_id=%s",
                     (request_id,),
                 ).fetchone()
@@ -467,7 +474,7 @@ class IdempotencyLedger:
         with self.lock, self._sqlite_connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT method,state,response_json,updated_at,request_fingerprint "
+                "SELECT method,state,response_json,updated_at,request_fingerprint,reconcile_json "
                 "FROM vcw_runner_idempotency_v1 WHERE request_id=?",
                 (request_id,),
             ).fetchone()
@@ -482,9 +489,9 @@ class IdempotencyLedger:
                     raise PolicyError("request_id already used for different request parameters")
                 return record
             conn.execute(
-                "INSERT INTO vcw_runner_idempotency_v1(request_id,method,state,updated_at,request_fingerprint) "
-                "VALUES(?,?,'RUNNING',?,?)",
-                (request_id, method, now, request_fingerprint),
+                "INSERT INTO vcw_runner_idempotency_v1(request_id,method,state,updated_at,request_fingerprint,reconcile_json) "
+                "VALUES(?,?,'RUNNING',?,?,?)",
+                (request_id, method, now, request_fingerprint, reconcile_json),
             )
         return None
 
@@ -749,6 +756,25 @@ class RunnerService:
             raise ValueError(status)
         return {"rpc_version": RPC_VERSION, "request_id": request_id, "server_id": self.cfg.server_id, "connection_generation": self.backend.generation, "status": status, "result": result, "error": None if code is None else {"code": code, "message": message or code}}
 
+    def reconciliation_hint(self, method: str, params: dict[str, Any], request_id: str) -> dict[str, Any] | None:
+        if method == "write_file":
+            path = self.policy.user_path(params.get("path"))
+            data = self.decode_content(params)
+            return {"kind": "file", "path": path, "sha256": sha256(data)}
+        if method == "transfer" and params.get("direction") == "upload":
+            path = self.policy.user_path(params.get("path"))
+            data = self.decode_content(params)
+            return {"kind": "file", "path": path, "sha256": sha256(data)}
+        if method == "start_job":
+            return {"kind": "job", "job_id": "job_" + hashlib.sha256(request_id.encode()).hexdigest()[:20]}
+        if method == "cancel_job":
+            return {"kind": "job", "job_id": params.get("job_id")}
+        if method == "apply_patch":
+            patch = params.get("patch")
+            touched = self.policy.patch_paths(patch)
+            return {"kind": "patch", "touched": touched, "patch_sha256": sha256(patch.encode())}
+        return None
+
     def dispatch(self, body: dict[str, Any]) -> dict[str, Any]:
         allowed_envelope = {"server_id", "request_id", "session_id", "method", "params"}
         extra_envelope = sorted(set(body) - allowed_envelope)
@@ -762,9 +788,10 @@ class RunnerService:
         params = self.policy.params(method, body.get("params"))
         fingerprint = canonical_request_fingerprint(self.cfg.server_id, method, params)
         has_side_effect = is_side_effect_request(method, params)
+        reconcile_hint = self.reconciliation_hint(method, params, request_id) if has_side_effect else None
         if has_side_effect:
             try:
-                prior = self.ledger.begin(request_id, method, fingerprint)
+                prior = self.ledger.begin(request_id, method, fingerprint, reconcile_hint)
             except PolicyError:
                 raise
             except Exception as exc:
@@ -782,6 +809,7 @@ class RunnerService:
                 running = self.response(
                     request_id,
                     "OUTCOME_UNKNOWN",
+                    {"reconcile_hint": prior.get("reconcile_hint")},
                     code="REQUEST_ALREADY_IN_FLIGHT",
                     message="reconcile before retrying",
                 )
@@ -791,9 +819,21 @@ class RunnerService:
         except PolicyError as exc:
             result = self.response(request_id, "DENIED", code="POLICY_DENIED", message=str(exc))
         except BackendTimeout as exc:
-            result = self.response(request_id, "OUTCOME_UNKNOWN", code="BACKEND_TIMEOUT", message=str(exc))
+            result = self.response(
+                request_id,
+                "OUTCOME_UNKNOWN",
+                {"reconcile_hint": reconcile_hint} if reconcile_hint is not None else None,
+                code="BACKEND_TIMEOUT",
+                message=str(exc),
+            )
         except BackendUncertain as exc:
-            result = self.response(request_id, "OUTCOME_UNKNOWN", code="BACKEND_OUTCOME_UNKNOWN", message=str(exc))
+            result = self.response(
+                request_id,
+                "OUTCOME_UNKNOWN",
+                {"reconcile_hint": reconcile_hint} if reconcile_hint is not None else None,
+                code="BACKEND_OUTCOME_UNKNOWN",
+                message=str(exc),
+            )
         except BackendFailure as exc:
             result = self.response(request_id, "FAILED", code="BACKEND_FAILURE", message=str(exc))
         except Exception as exc:
