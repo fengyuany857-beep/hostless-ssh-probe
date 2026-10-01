@@ -514,6 +514,60 @@ class ContractTests(unittest.TestCase):
 
         self.assertEqual(reset["count"], 1)
 
+    def test_canonical_path_cannot_alias_git_control_metadata(self):
+        policy = Policy("/srv/project", frozenset(), frozenset())
+        cfg = SimpleNamespace()
+
+        class Sftp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def normalize(self, path):
+                if path == "/srv/project/alias":
+                    return "/srv/project/.git"
+                if path == "/srv/project/alias/config":
+                    return "/srv/project/.git/config"
+                return path
+
+        class Client:
+            def open_sftp(self):
+                return Sftp()
+
+        backend = SSHBackend(cfg, policy)
+        backend.connect = lambda: Client()
+        with self.assertRaisesRegex(PolicyError, "control metadata"):
+            backend.canonical_existing_path("/srv/project/alias/config")
+
+    def test_new_write_parent_symlink_cannot_alias_runner_metadata(self):
+        policy = Policy("/srv/project", frozenset({"write_file"}), frozenset())
+        cfg = SimpleNamespace(max_file_bytes=1024)
+
+        class Sftp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def normalize(self, path):
+                if path == "/srv/project/alias":
+                    return "/srv/project/.vcw-runner"
+                return path
+
+        class Client:
+            def open_sftp(self):
+                return Sftp()
+
+        backend = SSHBackend(cfg, policy)
+        backend.connect = lambda: Client()
+        with self.assertRaisesRegex(PolicyError, "control metadata"):
+            backend.write_bytes_cas("/srv/project/alias/evil", b"x", None)
+
+    def test_internal_patch_stage_can_use_runner_control_metadata(self):
+        policy = Policy("/srv/project", frozenset(), frozenset())
+        self.assertEqual(policy.path("/srv/project/.vcw-runner/tmp/x.patch"), "/srv/project/.vcw-runner/tmp/x.patch")
+        with self.assertRaises(PolicyError):
+            policy.user_path("/srv/project/.vcw-runner/tmp/x.patch")
+
 
 if __name__ == "__main__":
     unittest.main()
