@@ -182,6 +182,100 @@ class ContractTests(unittest.TestCase):
     def test_backend_still_exposes_exec_argv(self):
         self.assertTrue(callable(getattr(SSHBackend, "exec_argv", None)))
 
+    def test_ledger_unavailable_blocks_side_effect(self):
+        service = RunnerService.__new__(RunnerService)
+        service.cfg = SimpleNamespace(server_id="srv")
+        service.policy = Policy("/srv/project", frozenset({"write_file"}), frozenset())
+        service.backend = SimpleNamespace(generation=2)
+
+        class Ledger:
+            def begin(self, request_id, method, fingerprint):
+                raise RuntimeError("db offline")
+
+        service.ledger = Ledger()
+        called = {"value": False}
+
+        def fake_write(rid, params):
+            called["value"] = True
+            return service.response(rid, "VERIFIED", {"sha256": "a" * 64})
+
+        service.rpc_write_file = fake_write
+        result = service.dispatch({
+            "server_id": "srv",
+            "request_id": "req-ledger-down",
+            "method": "write_file",
+            "params": {"path": "a.txt", "content": "x"},
+        })
+        self.assertFalse(called["value"])
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "LEDGER_UNAVAILABLE")
+
+    def test_transfer_download_skips_side_effect_ledger(self):
+        service = RunnerService.__new__(RunnerService)
+        service.cfg = SimpleNamespace(server_id="srv")
+        service.policy = Policy("/srv/project", frozenset({"transfer"}), frozenset())
+
+        class Backend:
+            generation = 1
+            def read_bytes(self, path):
+                return b"abc"
+
+        class Ledger:
+            def begin(self, *args):
+                self.called = True
+
+        ledger = Ledger()
+        ledger.called = False
+        service.backend = Backend()
+        service.ledger = ledger
+        result = service.dispatch({
+            "server_id": "srv",
+            "request_id": "req-download",
+            "method": "transfer",
+            "params": {"direction": "download", "path": "a.bin"},
+        })
+        self.assertFalse(ledger.called)
+        self.assertEqual(result["status"], "VERIFIED")
+        self.assertEqual(result["result"]["bytes"], 3)
+
+    def test_cached_response_uses_current_session_correlation(self):
+        service = RunnerService.__new__(RunnerService)
+        service.cfg = SimpleNamespace(server_id="srv")
+        service.policy = Policy("/srv/project", frozenset({"write_file"}), frozenset())
+        service.backend = SimpleNamespace(generation=4)
+
+        cached = {
+            "rpc_version": "vcw.runner.v1",
+            "request_id": "req-replay",
+            "server_id": "srv",
+            "connection_generation": 2,
+            "status": "VERIFIED",
+            "result": {"sha256": "a" * 64},
+            "error": None,
+            "session_id": "ses-old",
+        }
+
+        class Ledger:
+            def begin(self, request_id, method, fingerprint):
+                return {
+                    "method": method,
+                    "state": "VERIFIED",
+                    "response": cached,
+                    "updated_at": 1.0,
+                    "request_fingerprint": fingerprint,
+                }
+
+        service.ledger = Ledger()
+        result = service.dispatch({
+            "server_id": "srv",
+            "session_id": "ses-new",
+            "request_id": "req-replay",
+            "method": "write_file",
+            "params": {"path": "a.txt", "content": "x"},
+        })
+        self.assertEqual(result["session_id"], "ses-new")
+        self.assertEqual(cached["session_id"], "ses-old")
+
 
 if __name__ == "__main__":
     unittest.main()
