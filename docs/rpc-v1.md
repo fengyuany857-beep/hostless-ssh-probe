@@ -60,7 +60,7 @@ Side-effect methods are:
 - `cancel_job`
 - upload `transfer`
 
-The implementation currently also records download `transfer` through the side-effect ledger because `transfer` is one RPC method; callers must still use unique request IDs.
+Download `transfer` is read-only and does not claim the side-effect ledger. Upload `transfer` does.
 
 ## Response envelope
 
@@ -77,7 +77,7 @@ The implementation currently also records download `transfer` through the side-e
 }
 ```
 
-`session_id` is present only when supplied and validated.
+`session_id` is present only when supplied and validated. It is attached at response time and is not persisted as part of the cached action result.
 
 Runner statuses:
 
