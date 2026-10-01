@@ -59,6 +59,16 @@ class IdempotencyLedgerTests(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 store.begin("same-request", "exec", "fp-b")
 
+    def test_sqlite_uses_runner_specific_table_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = td + "/state.sqlite3"
+            IdempotencyLedger(path)
+            import sqlite3
+            with sqlite3.connect(path) as conn:
+                tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn("vcw_runner_idempotency_v1", tables)
+            self.assertNotIn("operations", tables)
+
 
 if __name__ == "__main__":
     unittest.main()
