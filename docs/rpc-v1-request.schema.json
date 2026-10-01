@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vcw.local/schema/runner/rpc-v1-request.schema.json",
+  "title": "VCW Remote Runner RPC v1 request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["server_id", "request_id", "method", "params"],
+  "properties": {
+    "server_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,160}$"},
+    "session_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,160}$"},
+    "method": {
+      "enum": ["read_file", "write_file", "apply_patch", "exec", "start_job", "job_status", "cancel_job", "transfer", "reconcile"]
+    },
+    "params": {"type": "object"}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"method": {"const": "read_file"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/read_file"}}}
+    },
+    {
+      "if": {"properties": {"method": {"const": "write_file"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/write_file"}}}
+    },
+    {
+      "if": {"properties": {"method": {"const": "apply_patch"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/apply_patch"}}}
+    },
+    {
+      "if": {"properties": {"method": {"const": "exec"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/exec"}}}
+    },
+    {
+      "if": {"properties": {"method": {"const": "start_job"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/start_job"}}}
+    },
+    {
+      "if": {"properties": {"method": {"const": "job_status"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/job_status"}}}
+    },
+    {
+      "if": {"properties": {"method": {"const": "cancel_job"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/cancel_job"}}}
+    },
+    {
+      "if": {"properties": {"method": {"const": "transfer"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/transfer"}}}
+    },
+    {
+      "if": {"properties": {"method": {"const": "reconcile"}}},
+      "then": {"properties": {"params": {"$ref": "#/$defs/reconcile"}}}
+    }
+  ],
+  "$defs": {
+    "path": {"type": "string", "minLength": 1},
+    "sha256": {"type": "string", "pattern": "^[0-9A-Fa-f]{64}$"},
+    "encoding": {"enum": ["utf-8", "base64"]},
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "read_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"$ref": "#/$defs/path"},
+        "encoding": {"$ref": "#/$defs/encoding"}
+      }
+    },
+    "write_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "content"],
+      "properties": {
+        "path": {"$ref": "#/$defs/path"},
+        "content": {"type": "string"},
+        "encoding": {"$ref": "#/$defs/encoding"},
+        "expected_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "apply_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["patch"],
+      "properties": {"patch": {"type": "string", "minLength": 1}}
+    },
+    "exec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv"],
+      "properties": {
+        "argv": {"$ref": "#/$defs/argv"},
+        "cwd": {"$ref": "#/$defs/path"},
+        "timeout_s": {"type": "number", "exclusiveMinimum": 0, "maximum": 300}
+      }
+    },
+    "start_job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["argv"],
+      "properties": {
+        "argv": {"$ref": "#/$defs/argv"},
+        "cwd": {"$ref": "#/$defs/path"}
+      }
+    },
+    "job_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id"],
+      "properties": {
+        "job_id": {"type": "string", "pattern": "^job_[A-Za-z0-9_-]{8,80}$"},
+        "max_log_bytes": {"type": "integer", "minimum": 0, "maximum": 131072}
+      }
+    },
+    "cancel_job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id"],
+      "properties": {
+        "job_id": {"type": "string", "pattern": "^job_[A-Za-z0-9_-]{8,80}$"}
+      }
+    },
+    "transfer": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["direction", "path", "content"],
+          "properties": {
+            "direction": {"const": "upload"},
+            "path": {"$ref": "#/$defs/path"},
+            "content": {"type": "string"},
+            "encoding": {"$ref": "#/$defs/encoding"},
+            "content_sha256": {"$ref": "#/$defs/sha256"},
+            "expected_sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["direction", "path"],
+          "properties": {
+            "direction": {"const": "download"},
+            "path": {"$ref": "#/$defs/path"}
+          }
+        }
+      ]
+    },
+    "reconcile": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "target_request_id"],
+          "properties": {
+            "kind": {"const": "request"},
+            "target_request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,160}$"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path", "sha256"],
+          "properties": {
+            "kind": {"const": "file"},
+            "path": {"$ref": "#/$defs/path"},
+            "sha256": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "job_id"],
+          "properties": {
+            "kind": {"const": "job"},
+            "job_id": {"type": "string", "pattern": "^job_[A-Za-z0-9_-]{8,80}$"},
+            "max_log_bytes": {"type": "integer", "minimum": 0, "maximum": 131072}
+          }
+        }
+      ]
+    }
+  }
+}
