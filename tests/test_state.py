@@ -31,7 +31,7 @@ class IdempotencyLedgerTests(unittest.TestCase):
 
             def run():
                 barrier.wait()
-                return store.begin("same-request", "write_file")
+                return store.begin("same-request", "write_file", "fp-a")
 
             with ThreadPoolExecutor(max_workers=8) as pool:
                 results = list(pool.map(lambda _: run(), range(8)))
@@ -39,12 +39,25 @@ class IdempotencyLedgerTests(unittest.TestCase):
             self.assertEqual(sum(x is None for x in results), 1)
             self.assertEqual(sum(x is not None and x["state"] == "RUNNING" for x in results), 7)
 
+    def test_request_id_cannot_change_parameters(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = IdempotencyLedger(td + "/state.sqlite3")
+            self.assertIsNone(store.begin("same-request", "write_file", "fp-a"))
+            with self.assertRaisesRegex(PolicyError, "different request parameters"):
+                store.begin("same-request", "write_file", "fp-b")
+
+    def test_finish_requires_existing_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = IdempotencyLedger(td + "/state.sqlite3")
+            with self.assertRaisesRegex(RuntimeError, "affected no row"):
+                store.finish("missing-request", "VERIFIED", {"status": "VERIFIED"})
+
     def test_request_id_cannot_change_method(self):
         with tempfile.TemporaryDirectory() as td:
             store = IdempotencyLedger(td + "/state.sqlite3")
-            self.assertIsNone(store.begin("same-request", "write_file"))
+            self.assertIsNone(store.begin("same-request", "write_file", "fp-a"))
             with self.assertRaises(PolicyError):
-                store.begin("same-request", "exec")
+                store.begin("same-request", "exec", "fp-b")
 
 
 if __name__ == "__main__":
