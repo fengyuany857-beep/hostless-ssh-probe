@@ -17,7 +17,7 @@ fake.SSHClient = object
 fake.SSHException = RuntimeError
 sys.modules.setdefault('paramiko', fake)
 
-from vcw_runner import Policy, PolicyError
+from vcw_runner import Policy, PolicyError, normalize_host_key_sha256
 
 class PolicyTests(unittest.TestCase):
     def setUp(self):
@@ -42,6 +42,16 @@ class PolicyTests(unittest.TestCase):
 
     def test_patch_path(self):
         self.assertEqual(self.p.patch_paths('--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+b\n'), ['a.txt'])
+
+    def test_host_key_sha256_normalization(self):
+        fp = 'mvDJ2jESSWKOfTD9wJH1217yaaHOZHhXS6ApxoihdlY'
+        self.assertEqual(normalize_host_key_sha256(fp), fp)
+        self.assertEqual(normalize_host_key_sha256('SHA256:' + fp), fp)
+        self.assertEqual(normalize_host_key_sha256('sha256:' + fp), fp)
+
+    def test_host_key_sha256_rejects_invalid(self):
+        with self.assertRaises(RuntimeError):
+            normalize_host_key_sha256('sha256:not-a-fingerprint')
 
 if __name__ == '__main__':
     unittest.main()
