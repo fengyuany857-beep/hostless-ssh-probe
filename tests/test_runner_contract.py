@@ -83,7 +83,12 @@ class ContractTests(unittest.TestCase):
 
         class Backend:
             generation = 1
+            def __init__(self):
+                self.calls = 0
             def internal_exec(self, command, timeout_s=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return ExecResult(0, "RUNNING\n---LOG---\n", "")
                 return ExecResult(45, "", "")
 
         service.backend = Backend()
@@ -397,6 +402,93 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result["mode"], "0755")
         self.assertEqual(sftp.fs["/srv/project/tool.sh"]["mode"], 0o755)
         self.assertEqual(sftp.fs["/srv/project/tool.sh"]["data"], b"new\n")
+
+    def test_cancel_does_not_signal_already_terminal_job(self):
+        service = RunnerService.__new__(RunnerService)
+        service.cfg = SimpleNamespace(project_root="/srv/project", backend_timeout_s=5, server_id="srv")
+        service.policy = Policy("/srv/project", frozenset(), frozenset())
+
+        class Backend:
+            generation = 1
+            def __init__(self):
+                self.calls = 0
+            def internal_exec(self, command, timeout_s=None):
+                self.calls += 1
+                return ExecResult(0, "EXIT 0\n---LOG---\n", "")
+
+        backend = Backend()
+        service.backend = backend
+        service.response = RunnerService.response.__get__(service, RunnerService)
+        result = service.rpc_cancel_job("req", {"job_id": "job_abcdefgh"})
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"]["code"], "JOB_ALREADY_TERMINAL")
+        self.assertEqual(backend.calls, 1)
+
+    def test_incomplete_existing_claim_never_reexecutes(self):
+        service = RunnerService.__new__(RunnerService)
+        service.cfg = SimpleNamespace(server_id="srv")
+        service.policy = Policy("/srv/project", frozenset({"write_file"}), frozenset())
+        service.backend = SimpleNamespace(generation=1)
+
+        class Ledger:
+            def begin(self, request_id, method, fingerprint, reconcile_hint=None):
+                return {
+                    "method": method,
+                    "state": "FAILED",
+                    "response": None,
+                    "updated_at": 1.0,
+                    "request_fingerprint": fingerprint,
+                    "reconcile_hint": reconcile_hint,
+                }
+
+        service.ledger = Ledger()
+        called = {"value": False}
+        def fake_write(rid, params):
+            called["value"] = True
+            return service.response(rid, "VERIFIED", {})
+        service.rpc_write_file = fake_write
+
+        result = service.dispatch({
+            "server_id": "srv",
+            "request_id": "req-incomplete",
+            "method": "write_file",
+            "params": {"path": "a.txt", "content": "x"},
+        })
+        self.assertFalse(called["value"])
+        self.assertEqual(result["status"], "OUTCOME_UNKNOWN")
+        self.assertEqual(result["error"]["code"], "REQUEST_INCOMPLETE")
+
+    def test_uncertain_write_returns_file_reconcile_hint(self):
+        service = RunnerService.__new__(RunnerService)
+        service.cfg = SimpleNamespace(server_id="srv")
+        service.policy = Policy("/srv/project", frozenset({"write_file"}), frozenset())
+        service.backend = SimpleNamespace(generation=2)
+
+        class Ledger:
+            def begin(self, request_id, method, fingerprint, reconcile_hint=None):
+                self.hint = reconcile_hint
+                return None
+            def finish(self, request_id, status, response):
+                self.response = response
+
+        ledger = Ledger()
+        service.ledger = ledger
+        def uncertain_write(rid, params):
+            raise BackendUncertain("connection lost after rename")
+        service.rpc_write_file = uncertain_write
+
+        result = service.dispatch({
+            "server_id": "srv",
+            "request_id": "req-uncertain-write",
+            "method": "write_file",
+            "params": {"path": "a.txt", "content": "hello"},
+        })
+        hint = result["result"]["reconcile_hint"]
+        self.assertEqual(result["status"], "OUTCOME_UNKNOWN")
+        self.assertEqual(hint["kind"], "file")
+        self.assertEqual(hint["path"], "/srv/project/a.txt")
+        self.assertEqual(hint["sha256"], __import__("hashlib").sha256(b"hello").hexdigest())
+        self.assertEqual(ledger.hint, hint)
 
 
 if __name__ == "__main__":
