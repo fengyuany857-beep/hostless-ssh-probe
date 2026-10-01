@@ -53,6 +53,16 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def normalize_host_key_sha256(value: str) -> str:
+    value = value.strip()
+    if value.lower().startswith("sha256:"):
+        value = value.split(":", 1)[1]
+    value = value.rstrip("=")
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}", value):
+        raise RuntimeError("SSH_HOST_KEY_SHA256 must be a SHA256 host-key fingerprint")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     runner_token: str
@@ -94,7 +104,7 @@ class Config:
             target_user=_required("TARGET_USER"),
             project_root=root.rstrip("/") or "/",
             ssh_private_key=key,
-            ssh_host_key_sha256=_required("SSH_HOST_KEY_SHA256").removeprefix("SHA256:").rstrip("="),
+            ssh_host_key_sha256=normalize_host_key_sha256(_required("SSH_HOST_KEY_SHA256")),
             allowed_tools=_csv("VCW_ALLOWED_TOOLS", "read_file,write_file,apply_patch,exec,start_job,job_status,cancel_job,transfer,reconcile"),
             allowed_exec=_csv("VCW_ALLOWED_EXEC", "git,python,python3,pytest,node,npm,npx"),
             backend_timeout_s=float(os.environ.get("VCW_BACKEND_TIMEOUT_S", "20")),
