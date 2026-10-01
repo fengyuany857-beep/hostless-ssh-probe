@@ -56,6 +56,24 @@ def _csv(name: str, default: str) -> frozenset[str]:
     return frozenset(x.strip() for x in os.environ.get(name, default).split(",") if x.strip())
 
 
+def _positive_finite_env(name: str, default: str, *, maximum: float | None = None) -> float:
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{name} must be a finite positive number") from exc
+    if not math.isfinite(value) or value <= 0 or (maximum is not None and value > maximum):
+        suffix = f" <= {maximum}" if maximum is not None else ""
+        raise RuntimeError(f"{name} must be a finite positive number{suffix}")
+    return value
+
+
+def normalize_exec_path(value: str) -> str:
+    entries = value.split(":")
+    if not entries or any(not x or not x.startswith("/") or posixpath.normpath(x) != x for x in entries):
+        raise RuntimeError("VCW_EXEC_PATH must be a colon-separated list of normalized absolute directories")
+    return ":".join(entries)
+
+
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -104,6 +122,7 @@ class Config:
     ssh_host_key_sha256: str
     allowed_tools: frozenset[str]
     allowed_exec: frozenset[str]
+    exec_path: str
     backend_timeout_s: float
     max_file_bytes: int
     max_output_bytes: int
@@ -122,26 +141,37 @@ class Config:
         root = _required("VCW_PROJECT_ROOT")
         if not root.startswith("/"):
             raise RuntimeError("VCW_PROJECT_ROOT must be absolute")
-        token = os.environ.get("RUNNER_TOKEN", os.environ.get("PROBE_TOKEN", "")).strip()
+        token = os.environ.get("RUNNER_TOKEN", "").strip()
         if not token:
             raise RuntimeError("RUNNER_TOKEN is required")
+        target_port = int(os.environ.get("TARGET_PORT", "22"))
+        port = int(os.environ.get("PORT", "8080"))
+        if not 1 <= target_port <= 65535:
+            raise RuntimeError("TARGET_PORT must be between 1 and 65535")
+        if not 1 <= port <= 65535:
+            raise RuntimeError("PORT must be between 1 and 65535")
+        max_file_bytes = int(os.environ.get("VCW_MAX_FILE_BYTES", str(4 * 1024 * 1024)))
+        max_output_bytes = int(os.environ.get("VCW_MAX_OUTPUT_BYTES", str(1024 * 1024)))
+        if max_file_bytes <= 0 or max_output_bytes <= 0:
+            raise RuntimeError("VCW_MAX_FILE_BYTES and VCW_MAX_OUTPUT_BYTES must be positive")
         return cls(
             runner_token=token,
             server_id=_required("VCW_SERVER_ID"),
             target_host=_required("TARGET_HOST"),
-            target_port=int(os.environ.get("TARGET_PORT", "22")),
+            target_port=target_port,
             target_user=_required("TARGET_USER"),
             project_root=root.rstrip("/") or "/",
             ssh_private_key=key,
             ssh_host_key_sha256=normalize_host_key_sha256(_required("SSH_HOST_KEY_SHA256")),
             allowed_tools=_csv("VCW_ALLOWED_TOOLS", "read_file,write_file,apply_patch,exec,start_job,job_status,cancel_job,transfer,reconcile"),
             allowed_exec=_csv("VCW_ALLOWED_EXEC", "git,python,python3,pytest,node,npm,npx"),
-            backend_timeout_s=float(os.environ.get("VCW_BACKEND_TIMEOUT_S", "20")),
-            max_file_bytes=int(os.environ.get("VCW_MAX_FILE_BYTES", str(4 * 1024 * 1024))),
-            max_output_bytes=int(os.environ.get("VCW_MAX_OUTPUT_BYTES", str(1024 * 1024))),
+            exec_path=normalize_exec_path(os.environ.get("VCW_EXEC_PATH", "/usr/local/bin:/usr/bin:/bin")),
+            backend_timeout_s=_positive_finite_env("VCW_BACKEND_TIMEOUT_S", "20", maximum=300.0),
+            max_file_bytes=max_file_bytes,
+            max_output_bytes=max_output_bytes,
             max_inflight=max(1, int(os.environ.get("VCW_MAX_INFLIGHT", "4"))),
             ledger_db=os.environ.get("VCW_LEDGER_DATABASE_URL", "").strip() or os.environ.get("VCW_LEDGER_DB", "/tmp/vcw-runner-ledger.sqlite3"),
-            port=int(os.environ.get("PORT", "8080")),
+            port=port,
         )
 
 
@@ -198,6 +228,8 @@ class Policy:
         if any("\x00" in x or "\n" in x or "\r" in x for x in value):
             raise PolicyError("argv contains forbidden control characters")
         exe = posixpath.basename(value[0])
+        if value[0] != exe:
+            raise PolicyError("argv[0] must be a bare executable name, not a path")
         if exe not in self.executables:
             raise PolicyError(f"executable not allowed: {exe}")
         return list(value)
@@ -484,6 +516,15 @@ class SSHBackend:
             self.policy.path(parent)
             return self.policy.path(posixpath.join(parent, posixpath.basename(lexical)))
 
+    def canonical_existing_path(self, path: str) -> str:
+        with self.lock:
+            try:
+                with self.connect().open_sftp() as sftp:
+                    return self.canonical(sftp, path)
+            except socket.timeout as exc:
+                self.reset()
+                raise BackendTimeout("SFTP path resolution timed out") from exc
+
     def read_bytes(self, path: str) -> bytes:
         with self.lock:
             try:
@@ -582,6 +623,7 @@ class SSHBackend:
 
     def internal_exec(self, command: str, timeout_s: float | None = None) -> ExecResult:
         timeout = float(timeout_s or self.cfg.backend_timeout_s)
+        command = "PATH={}; export PATH; {}".format(shlex.quote(self.cfg.exec_path), command)
         with self.lock:
             try:
                 code, out, err = run_command_channel(
@@ -597,6 +639,16 @@ class SSHBackend:
                 raise BackendTimeout(str(exc)) from exc
             except CommandOutputTooLarge as exc:
                 raise BackendFailure(str(exc)) from exc
+
+    def exec_argv(self, argv: list[str], cwd: str | None, timeout_s: float | None = None) -> ExecResult:
+        argv = self.policy.argv(argv)
+        cwd = self.canonical_existing_path(self.policy.cwd(cwd))
+        timeout = self.cfg.backend_timeout_s if timeout_s is None else self.policy.timeout(timeout_s)
+        command = "cd -- {} && exec {}".format(
+            shlex.quote(cwd),
+            " ".join(shlex.quote(x) for x in argv),
+        )
+        return self.internal_exec(command, timeout)
 
 
 class RunnerService:
@@ -771,7 +823,7 @@ class RunnerService:
 
     def rpc_start_job(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         argv = self.policy.argv(p.get("argv"))
-        cwd = self.policy.cwd(p.get("cwd"))
+        cwd = self.backend.canonical_existing_path(self.policy.cwd(p.get("cwd")))
         job_id = "job_" + hashlib.sha256(rid.encode()).hexdigest()[:20]
         paths = self.job_paths(job_id)
         inner = "cd -- {} && {}; rc=$?; printf '%s\\n' \"$rc\" > {}; exit \"$rc\"".format(
