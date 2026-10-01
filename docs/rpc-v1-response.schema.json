@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vcw.local/schema/runner/rpc-v1-response.schema.json",
+  "title": "VCW Remote Runner RPC v1 response envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "rpc_version",
+    "request_id",
+    "server_id",
+    "connection_generation",
+    "status",
+    "result",
+    "error"
+  ],
+  "properties": {
+    "rpc_version": {"const": "vcw.runner.v1"},
+    "request_id": {"type": "string"},
+    "session_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,160}$"},
+    "server_id": {"type": "string"},
+    "connection_generation": {"type": "integer", "minimum": 0},
+    "status": {"enum": ["VERIFIED", "FAILED", "OUTCOME_UNKNOWN", "DENIED", "RATE_LIMITED"]},
+    "result": {
+      "type": ["object", "null"],
+      "description": "Method-specific structured result. Shapes are normative in docs/rpc-v1.md."
+    },
+    "error": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message"],
+          "properties": {
+            "code": {"type": "string", "minLength": 1},
+            "message": {"type": "string"}
+          }
+        }
+      ]
+    }
+  }
+}
