@@ -186,13 +186,25 @@ class OperationStore:
         return {"method": row[0], "state": row[1], "response": json.loads(row[2]) if row[2] else None, "updated_at": row[3]}
 
     def begin(self, request_id: str, method: str) -> dict[str, Any] | None:
-        old = self.get(request_id)
-        if old:
-            if old["method"] != method:
-                raise PolicyError("request_id already used for another method")
-            return old
         with self.lock, self._connect() as conn:
-            conn.execute("INSERT INTO operations(request_id,method,state,updated_at) VALUES(?,?,'RUNNING',?)", (request_id, method, time.time()))
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT method,state,response_json,updated_at FROM operations WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if row:
+                if row[0] != method:
+                    raise PolicyError("request_id already used for another method")
+                return {
+                    "method": row[0],
+                    "state": row[1],
+                    "response": json.loads(row[2]) if row[2] else None,
+                    "updated_at": row[3],
+                }
+            conn.execute(
+                "INSERT INTO operations(request_id,method,state,updated_at) VALUES(?,?,'RUNNING',?)",
+                (request_id, method, time.time()),
+            )
         return None
 
     def finish(self, request_id: str, status: str, response: dict[str, Any]) -> None:
@@ -552,7 +564,20 @@ class RunnerService:
             if not old:
                 return self.response(rid, "OUTCOME_UNKNOWN", None, "REQUEST_NOT_FOUND", "no local request record")
             if old["response"]:
-                return self.response(rid, "VERIFIED", {"target_request_id": target, "record": old})
+                observed = old["response"].get("status", "OUTCOME_UNKNOWN")
+                if observed == "OUTCOME_UNKNOWN":
+                    return self.response(
+                        rid,
+                        "OUTCOME_UNKNOWN",
+                        {"target_request_id": target, "record": old},
+                        "REQUEST_OUTCOME_UNKNOWN",
+                        "stored request outcome is still unknown",
+                    )
+                return self.response(
+                    rid,
+                    "VERIFIED",
+                    {"target_request_id": target, "observed_status": observed, "record": old},
+                )
             return self.response(rid, "OUTCOME_UNKNOWN", {"target_request_id": target, "record": old}, "REQUEST_INCOMPLETE", "no terminal response")
         if kind == "file":
             path = self.policy.path(p.get("path"))
