@@ -38,6 +38,6 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests -v
         timeout-minutes: 2
-      - run: python -m py_compile app.py vcw_runner.py channel_exec.py tools/ledger_persistence_acceptance.py
+      - run: python -m py_compile app.py vcw_runner.py channel_exec.py tools/ledger_persistence_acceptance.py tools/live_freeze_acceptance.py
       - run: python -m json.tool docs/rpc-v1-request.schema.json >/dev/null
       - run: python -m json.tool docs/rpc-v1-response.schema.json >/dev/null
