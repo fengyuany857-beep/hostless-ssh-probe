@@ -8,7 +8,7 @@ from vcw_runner import Config
 class ConfigTests(unittest.TestCase):
     def base_env(self):
         return {
-            "RUNNER_TOKEN": "token",
+            "RUNNER_TOKEN": "t" * 64,
             "VCW_SERVER_ID": "srv-1",
             "TARGET_HOST": "127.0.0.1",
             "TARGET_PORT": "22",
@@ -68,6 +68,14 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(RuntimeError, "VCW_MAX_INFLIGHT"):
                     self.load(VCW_MAX_INFLIGHT=value)
+
+    def test_short_runner_token_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "at least 32"):
+            self.load(RUNNER_TOKEN="short-token")
+
+    def test_server_id_must_match_rpc_safe_id(self):
+        with self.assertRaisesRegex(RuntimeError, "safe-id"):
+            self.load(VCW_SERVER_ID="bad id with spaces")
 
 
 if __name__ == "__main__":
