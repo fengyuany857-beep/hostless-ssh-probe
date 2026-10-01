@@ -49,8 +49,17 @@ def require_durable_postgres() -> dict:
     return info
 
 
+def build_identity(info: dict) -> dict:
+    build = info.get("build") or {}
+    fingerprint = build.get("fingerprint_sha256")
+    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+        raise RuntimeError(f"Runner build fingerprint is missing or invalid: {build!r}")
+    return {"fingerprint_sha256": fingerprint, "revision": build.get("revision")}
+
+
 def prepare() -> None:
-    require_durable_postgres()
+    info = require_durable_postgres()
+    build = build_identity(info)
 
     run = str(int(time.time()))
     rel = f"ledger-persistence-{run}.txt"
@@ -91,10 +100,13 @@ def prepare() -> None:
         "side_effect_request_id": side_effect_rid,
         "side_effect_body": side_effect_body,
         "original_response": original,
+        "build": build,
+        "ledger": info.get("idempotency_ledger"),
     }
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
 
     print("PASS durable_postgres_active")
+    print("PASS build_identity_captured")
     print("PASS side_effect_verified")
     print(f"REQUEST_ID={side_effect_rid}")
     print(f"STATE_FILE={STATE_FILE}")
@@ -103,9 +115,19 @@ def prepare() -> None:
 
 def verify() -> None:
     info = require_durable_postgres()
+    current_build = build_identity(info)
     if not STATE_FILE.exists():
         raise RuntimeError(f"acceptance state file not found: {STATE_FILE}")
     state = json.loads(STATE_FILE.read_text())
+    prepared_build = state.get("build") or {}
+    allow_build_change = os.environ.get("VCW_LEDGER_ACCEPTANCE_ALLOW_BUILD_CHANGE", "").strip() == "1"
+    if current_build != prepared_build and not allow_build_change:
+        raise RuntimeError(
+            "Runner build changed between prepare and verify; "
+            f"prepared={prepared_build} current={current_build}. "
+            "Repeat prepare/verify on one release build or explicitly set "
+            "VCW_LEDGER_ACCEPTANCE_ALLOW_BUILD_CHANGE=1 for a migration-only test."
+        )
 
     target_rid = state["side_effect_request_id"]
     reconcile = rpc(
@@ -138,6 +160,7 @@ def verify() -> None:
         raise RuntimeError(f"final file proof failed: {readback}")
 
     print("PASS durable_postgres_active")
+    print("PASS build_identity_bound")
     print("PASS reconcile_survived_redeploy")
     print("PASS cached_terminal_response_replayed")
     print("PASS side_effect_not_reexecuted")
