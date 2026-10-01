@@ -20,7 +20,7 @@ class PostgresLedgerTests(unittest.TestCase):
     def test_terminal_response_survives_new_ledger_instance(self):
         rid = self.rid("replay")
         first = IdempotencyLedger(self.url)
-        self.assertIsNone(first.begin(rid, "write_file"))
+        self.assertIsNone(first.begin(rid, "write_file", "fp-a"))
 
         response = {
             "rpc_version": "vcw.runner.v1",
@@ -32,10 +32,18 @@ class PostgresLedgerTests(unittest.TestCase):
         first.finish(rid, "VERIFIED", response)
 
         second = IdempotencyLedger(self.url)
-        prior = second.begin(rid, "write_file")
+        prior = second.begin(rid, "write_file", "fp-a")
         self.assertIsNotNone(prior)
         self.assertEqual(prior["state"], "VERIFIED")
         self.assertEqual(prior["response"], response)
+
+    def test_request_id_cannot_change_parameters_across_instances(self):
+        rid = self.rid("params")
+        first = IdempotencyLedger(self.url)
+        second = IdempotencyLedger(self.url)
+        self.assertIsNone(first.begin(rid, "write_file", "fp-a"))
+        with self.assertRaisesRegex(PolicyError, "different request parameters"):
+            second.begin(rid, "write_file", "fp-b")
 
     def test_request_id_cannot_change_method_across_instances(self):
         rid = self.rid("method")
@@ -52,7 +60,7 @@ class PostgresLedgerTests(unittest.TestCase):
 
         def attempt(index):
             barrier.wait()
-            return ledgers[index].begin(rid, "write_file")
+            return ledgers[index].begin(rid, "write_file", "fp-a")
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(attempt, range(8)))
