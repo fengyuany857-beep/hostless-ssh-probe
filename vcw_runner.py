@@ -1058,8 +1058,8 @@ class RunnerService:
         max_log = raw_max_log
 
         cmd = (
-            "if [ -f {exitf} ]; then printf 'EXIT '; cat {exitf}; "
-            "elif [ -f {cancelled} ]; then printf 'CANCELLED\\n'; "
+            "if [ -f {cancelled} ]; then printf 'CANCELLED\\n'; "
+            "elif [ -f {exitf} ]; then printf 'EXIT '; cat {exitf}; "
             "elif [ -f {pid} ] && [ -f {start_ticks} ] && [ -f {boot_id} ]; then "
             "pid=$(cat {pid}); expected_start=$(cat {start_ticks}); expected_boot=$(cat {boot_id}); "
             "current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true); "
@@ -1120,6 +1120,29 @@ class RunnerService:
 
     def rpc_cancel_job(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         job_id = p.get("job_id")
+        observed = self.rpc_job_status(rid, {"job_id": job_id, "max_log_bytes": 0})
+        if observed["status"] == "FAILED":
+            return observed
+        if observed["status"] == "OUTCOME_UNKNOWN":
+            return self.response(
+                rid,
+                "OUTCOME_UNKNOWN",
+                {"job_id": job_id, "observed": observed.get("result")},
+                "CANCEL_PRECONDITION_UNKNOWN",
+                "job identity/state is uncertain; refusing to signal any process",
+            )
+        observed_state = (observed.get("result") or {}).get("state")
+        if observed_state == "CANCELLED":
+            return self.response(rid, "VERIFIED", {"job_id": job_id, "state": "CANCELLED"})
+        if observed_state in {"SUCCEEDED", "FAILED"}:
+            return self.response(
+                rid,
+                "FAILED",
+                {"job_id": job_id, "state": observed_state, "exit_code": (observed.get("result") or {}).get("exit_code")},
+                "JOB_ALREADY_TERMINAL",
+                "job already reached a terminal state before cancellation",
+            )
+
         paths = self.job_paths(job_id)
         cmd = (
             "if [ ! -f {pid} ] || [ ! -f {start_ticks} ] || [ ! -f {boot_id} ]; then exit 44; fi; "
