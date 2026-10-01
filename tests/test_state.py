@@ -69,6 +69,22 @@ class IdempotencyLedgerTests(unittest.TestCase):
             self.assertIn("vcw_runner_idempotency_v1", tables)
             self.assertNotIn("operations", tables)
 
+    def test_reconcile_hint_persists_with_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = IdempotencyLedger(td + "/state.sqlite3")
+            hint = {"kind": "file", "path": "/srv/project/a.txt", "sha256": "a" * 64}
+            self.assertIsNone(store.begin("req-hint", "write_file", "fp-a", hint))
+            record = store.get("req-hint")
+            self.assertEqual(record["reconcile_hint"], hint)
+
+    def test_terminal_record_cannot_be_finished_twice(self):
+        with tempfile.TemporaryDirectory() as td:
+            store = IdempotencyLedger(td + "/state.sqlite3")
+            self.assertIsNone(store.begin("req-finish", "write_file", "fp-a"))
+            store.finish("req-finish", "VERIFIED", {"status": "VERIFIED"})
+            with self.assertRaisesRegex(RuntimeError, "affected no row"):
+                store.finish("req-finish", "FAILED", {"status": "FAILED"})
+
 
 if __name__ == "__main__":
     unittest.main()
