@@ -39,5 +39,21 @@ jobs:
       - run: python -m unittest discover -s tests -v
         timeout-minutes: 2
       - run: python -m py_compile app.py vcw_runner.py channel_exec.py tools/ledger_persistence_acceptance.py tools/live_freeze_acceptance.py
+      - name: Print Runner build fingerprint
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          h = hashlib.sha256()
+          for name in ("app.py", "vcw_runner.py", "channel_exec.py", "requirements.txt"):
+              data = Path(name).read_bytes()
+              h.update(name.encode("utf-8"))
+              h.update(b"\0")
+              h.update(str(len(data)).encode("ascii"))
+              h.update(b"\0")
+              h.update(data)
+              h.update(b"\0")
+          print("VCW_RUNNER_BUILD_FINGERPRINT=" + h.hexdigest())
+          PY
       - run: python -m json.tool docs/rpc-v1-request.schema.json >/dev/null
       - run: python -m json.tool docs/rpc-v1-response.schema.json >/dev/null
