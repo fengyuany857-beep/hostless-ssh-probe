@@ -784,6 +784,14 @@ class SSHBackend:
             except CommandOutputTooLarge as exc:
                 self.reset()
                 raise BackendUncertain(f"{exc}; remote command outcome is unknown") from exc
+            except socket.timeout as exc:
+                self.reset()
+                raise BackendTimeout("SSH command transport timed out") from exc
+            except (EOFError, OSError, paramiko.SSHException) as exc:
+                self.reset()
+                raise BackendUncertain(
+                    f"SSH command transport failed ({type(exc).__name__}); remote command outcome is unknown"
+                ) from exc
 
     def exec_argv(self, argv: list[str], cwd: str | None, timeout_s: float | None = None) -> ExecResult:
         argv = self.policy.argv(argv)
