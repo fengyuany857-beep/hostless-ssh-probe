@@ -20,6 +20,8 @@ from typing import Any
 
 import paramiko
 
+from channel_exec import CommandOutputTooLarge, CommandTimeout, run_command_channel
+
 RPC_VERSION = "vcw.runner.v1"
 STATUSES = {"VERIFIED", "FAILED", "OUTCOME_UNKNOWN", "DENIED", "RATE_LIMITED"}
 SIDE_EFFECTS = {"write_file", "apply_patch", "exec", "start_job", "cancel_job", "transfer"}
@@ -389,17 +391,19 @@ class SSHBackend:
         timeout = float(timeout_s or self.cfg.backend_timeout_s)
         with self.lock:
             try:
-                _, stdout, stderr = self.connect().exec_command(command, timeout=timeout)
-                stdout.channel.settimeout(timeout)
-                code = stdout.channel.recv_exit_status()
-                out = stdout.read(self.cfg.max_output_bytes + 1)
-                err = stderr.read(self.cfg.max_output_bytes + 1)
-                if len(out) > self.cfg.max_output_bytes or len(err) > self.cfg.max_output_bytes:
-                    raise BackendFailure("command output exceeded VCW_MAX_OUTPUT_BYTES")
+                code, out, err = run_command_channel(
+                    self.connect(),
+                    command,
+                    command_timeout_s=timeout,
+                    open_timeout_s=self.cfg.backend_timeout_s,
+                    max_output_bytes=self.cfg.max_output_bytes,
+                )
                 return ExecResult(code, out.decode(errors="replace"), err.decode(errors="replace"))
-            except socket.timeout as exc:
+            except CommandTimeout as exc:
                 self.reset()
-                raise BackendTimeout("SSH exec timed out") from exc
+                raise BackendTimeout(str(exc)) from exc
+            except CommandOutputTooLarge as exc:
+                raise BackendFailure(str(exc)) from exc
 
 
 class RunnerService:
