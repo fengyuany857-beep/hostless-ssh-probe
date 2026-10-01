@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -14,6 +15,16 @@ from vcw_runner import Config, PolicyError, RPC_VERSION, RunnerService
 CFG = Config.from_env()
 SERVICE = RunnerService(CFG)
 INFLIGHT = threading.BoundedSemaphore(CFG.max_inflight)
+REQUEST_BODY_LIMIT = ((CFG.max_file_bytes + 2) // 3) * 4 + 1024 * 1024
+AUDIT_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+
+
+def safe_audit_id(value):
+    return value if isinstance(value, str) and AUDIT_ID.fullmatch(value) else None
+
+
+def safe_audit_method(value):
+    return value if isinstance(value, str) and value in CFG.allowed_tools else None
 
 
 def runtime_build_fingerprint() -> str:
@@ -83,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return self._json(400, {"ok": False, "error": "invalid content length"})
-        if length <= 0 or length > CFG.max_file_bytes + 1024 * 1024:
+        if length <= 0 or length > REQUEST_BODY_LIMIT:
             return self._json(413, {"ok": False, "error": "request body too large"})
         try:
             body = json.loads(self.rfile.read(length), parse_constant=reject_nonstandard_json_constant)
@@ -93,20 +104,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "error": "RPC body must be an object"})
 
         if not INFLIGHT.acquire(blocking=False):
-            rid = body.get("request_id", "")
+            rid = safe_audit_id(body.get("request_id")) or ""
+            method = safe_audit_method(body.get("method"))
             payload = {"rpc_version": RPC_VERSION, "request_id": rid, "server_id": CFG.server_id, "connection_generation": SERVICE.backend.generation, "status": "RATE_LIMITED", "result": None, "error": {"code": "RUNNER_INFLIGHT_LIMIT", "message": "runner concurrency cap reached"}}
-            audit("rpc.rate_limited", request_id=rid, method=body.get("method"), reason="RUNNER_INFLIGHT_LIMIT")
+            audit("rpc.rate_limited", request_id=rid or None, method=method, status="RATE_LIMITED", connection_generation=SERVICE.backend.generation)
             return self._json(429, payload, {"Retry-After": "1"})
 
-        rid = body.get("request_id", "")
-        method = body.get("method")
+        rid = safe_audit_id(body.get("request_id"))
+        method = safe_audit_method(body.get("method"))
         started = time.time()
         try:
             response = SERVICE.dispatch(body)
             audit(
                 "rpc.completed",
                 request_id=rid,
-                session_id=response.get("session_id"),
+                session_id=safe_audit_id(response.get("session_id")),
                 method=method,
                 status=response.get("status"),
                 duration_ms=int((time.time() - started) * 1000),
@@ -114,32 +126,34 @@ class Handler(BaseHTTPRequestHandler):
             )
             return self._json(200, response)
         except PolicyError as exc:
-            audit("rpc.denied", request_id=rid, session_id=body.get("session_id"), method=method, reason=str(exc))
+            audit("rpc.denied", request_id=rid, session_id=safe_audit_id(body.get("session_id")), method=method, status="DENIED", connection_generation=SERVICE.backend.generation)
             payload = {
                 "rpc_version": RPC_VERSION,
-                "request_id": rid if isinstance(rid, str) else "",
+                "request_id": rid or "",
                 "server_id": CFG.server_id,
                 "connection_generation": SERVICE.backend.generation,
                 "status": "DENIED",
                 "result": None,
                 "error": {"code": "POLICY_DENIED", "message": str(exc)},
             }
-            if isinstance(body.get("session_id"), str):
-                payload["session_id"] = body.get("session_id")
+            session_id = safe_audit_id(body.get("session_id"))
+            if session_id is not None:
+                payload["session_id"] = session_id
             return self._json(400, payload)
         except Exception as exc:
-            audit("rpc.failed", request_id=rid, session_id=body.get("session_id"), method=method, error=type(exc).__name__)
+            audit("rpc.failed", request_id=rid, session_id=safe_audit_id(body.get("session_id")), method=method, status="FAILED", error=type(exc).__name__, connection_generation=SERVICE.backend.generation)
             payload = {
                 "rpc_version": RPC_VERSION,
-                "request_id": rid if isinstance(rid, str) else "",
+                "request_id": rid or "",
                 "server_id": CFG.server_id,
                 "connection_generation": SERVICE.backend.generation,
                 "status": "FAILED",
                 "result": None,
                 "error": {"code": type(exc).__name__, "message": str(exc)},
             }
-            if isinstance(body.get("session_id"), str):
-                payload["session_id"] = body.get("session_id")
+            session_id = safe_audit_id(body.get("session_id"))
+            if session_id is not None:
+                payload["session_id"] = session_id
             return self._json(500, payload)
         finally:
             INFLIGHT.release()
