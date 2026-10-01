@@ -60,7 +60,7 @@ The target SSH account must also be manually verified as least-privileged. Runne
 - `reconcile(kind=job)` returns observed durable job state.
 - `reconcile(kind=request)` does not turn a stored `OUTCOME_UNKNOWN` into a false `VERIFIED`.
 
-Production Hostless acceptance must use a durable PostgreSQL request ledger via `VCW_STATE_DATABASE_URL`. SQLite via `VCW_STATE_DB` is retained only for local/dev use; the default `/tmp/vcw-runner.sqlite3` is restart-local and is not acceptable for a frozen production Runner. After switching to PostgreSQL, create a terminal side-effect request, redeploy the Hostless app, and verify that `reconcile(kind=request)` still observes the stored terminal response without repeating the action.
+Production Hostless acceptance must use a durable PostgreSQL request ledger via `VCW_LEDGER_DATABASE_URL`. SQLite via `VCW_LEDGER_DB` is retained only for local/dev use; the default `/tmp/vcw-runner.sqlite3` is restart-local and is not acceptable for a frozen production Runner. After switching to PostgreSQL, create a terminal side-effect request, redeploy the Hostless app, and verify that `reconcile(kind=request)` still observes the stored terminal response without repeating the action.
 
 ## Rate limiting and audit
 
