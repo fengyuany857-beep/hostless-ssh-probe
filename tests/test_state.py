@@ -20,13 +20,13 @@ fake.SSHClient = object
 fake.SSHException = RuntimeError
 sys.modules.setdefault("paramiko", fake)
 
-from vcw_runner import OperationStore, PolicyError
+from vcw_runner import IdempotencyLedger, PolicyError
 
 
-class OperationStoreTests(unittest.TestCase):
+class IdempotencyLedgerTests(unittest.TestCase):
     def test_concurrent_begin_is_atomic(self):
         with tempfile.TemporaryDirectory() as td:
-            store = OperationStore(td + "/state.sqlite3")
+            store = IdempotencyLedger(td + "/state.sqlite3")
             barrier = threading.Barrier(8)
 
             def run():
@@ -41,7 +41,7 @@ class OperationStoreTests(unittest.TestCase):
 
     def test_request_id_cannot_change_method(self):
         with tempfile.TemporaryDirectory() as td:
-            store = OperationStore(td + "/state.sqlite3")
+            store = IdempotencyLedger(td + "/state.sqlite3")
             self.assertIsNone(store.begin("same-request", "write_file"))
             with self.assertRaises(PolicyError):
                 store.begin("same-request", "exec")
