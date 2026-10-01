@@ -159,6 +159,29 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "OUTCOME_UNKNOWN")
         self.assertEqual(result["error"]["code"], "PATCH_POSTCONDITION_UNVERIFIED")
 
+    def test_unknown_envelope_fields_are_denied_before_execution(self):
+        service = RunnerService.__new__(RunnerService)
+        service.cfg = SimpleNamespace(server_id="srv")
+        service.policy = Policy("/srv/project", frozenset({"write_file"}), frozenset())
+        service.backend = SimpleNamespace(generation=1)
+
+        class Ledger:
+            def begin(self, *args):
+                raise AssertionError("ledger must not be touched")
+        service.ledger = Ledger()
+
+        with self.assertRaisesRegex(PolicyError, "unsupported RPC envelope fields"):
+            service.dispatch({
+                "server_id": "srv",
+                "request_id": "req-1",
+                "method": "write_file",
+                "params": {"path": "a.txt", "content": "x"},
+                "host": "127.0.0.1",
+            })
+
+    def test_backend_still_exposes_exec_argv(self):
+        self.assertTrue(callable(getattr(SSHBackend, "exec_argv", None)))
+
 
 if __name__ == "__main__":
     unittest.main()
