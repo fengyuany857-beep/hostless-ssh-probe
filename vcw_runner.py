@@ -211,6 +211,57 @@ class Policy:
             raise PolicyError("timeout_s must be a finite positive number")
         return min(timeout, 300.0)
 
+    def params(self, method: str, value: object) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise PolicyError("params must be an object")
+
+        fixed: dict[str, tuple[set[str], set[str]]] = {
+            "read_file": ({"path", "encoding"}, {"path"}),
+            "write_file": ({"path", "content", "encoding", "expected_sha256"}, {"path", "content"}),
+            "apply_patch": ({"patch"}, {"patch"}),
+            "exec": ({"argv", "cwd", "timeout_s"}, {"argv"}),
+            "start_job": ({"argv", "cwd"}, {"argv"}),
+            "job_status": ({"job_id", "max_log_bytes"}, {"job_id"}),
+            "cancel_job": ({"job_id"}, {"job_id"}),
+        }
+        if method in fixed:
+            allowed, required = fixed[method]
+        elif method == "transfer":
+            direction = value.get("direction")
+            if direction == "upload":
+                allowed = {"direction", "path", "content", "encoding", "content_sha256", "expected_sha256"}
+                required = {"direction", "path", "content"}
+            elif direction == "download":
+                allowed = {"direction", "path"}
+                required = {"direction", "path"}
+            else:
+                allowed = {"direction", "path"}
+                required = {"direction", "path"}
+        elif method == "reconcile":
+            kind = value.get("kind")
+            if kind == "request":
+                allowed = {"kind", "target_request_id"}
+                required = {"kind", "target_request_id"}
+            elif kind == "file":
+                allowed = {"kind", "path", "sha256"}
+                required = {"kind", "path", "sha256"}
+            elif kind == "job":
+                allowed = {"kind", "job_id", "max_log_bytes"}
+                required = {"kind", "job_id"}
+            else:
+                allowed = {"kind"}
+                required = {"kind"}
+        else:
+            raise PolicyError(f"tool not allowed: {method}")
+
+        extra = sorted(set(value) - allowed)
+        if extra:
+            raise PolicyError(f"unsupported params for {method}: {','.join(extra)}")
+        missing = sorted(required - set(value))
+        if missing:
+            raise PolicyError(f"missing required params for {method}: {','.join(missing)}")
+        return value
+
     def path(self, value: object) -> str:
         if not isinstance(value, str) or not value or "\x00" in value:
             raise PolicyError("invalid path")
@@ -664,14 +715,16 @@ class RunnerService:
         return {"rpc_version": RPC_VERSION, "request_id": request_id, "server_id": self.cfg.server_id, "connection_generation": self.backend.generation, "status": status, "result": result, "error": None if code is None else {"code": code, "message": message or code}}
 
     def dispatch(self, body: dict[str, Any]) -> dict[str, Any]:
+        allowed_envelope = {"server_id", "request_id", "session_id", "method", "params"}
+        extra_envelope = sorted(set(body) - allowed_envelope)
+        if extra_envelope:
+            raise PolicyError(f"unsupported RPC envelope fields: {','.join(extra_envelope)}")
         request_id = self.policy.check_request_id(body.get("request_id"))
         if body.get("server_id") != self.cfg.server_id:
             raise PolicyError("server_id mismatch")
         session_id = self.policy.check_session_id(body.get("session_id"))
         method = self.policy.check_tool(body.get("method"))
-        params = body.get("params", {})
-        if not isinstance(params, dict):
-            raise PolicyError("params must be an object")
+        params = self.policy.params(method, body.get("params"))
         fingerprint = canonical_request_fingerprint(self.cfg.server_id, method, params)
         if method in SIDE_EFFECTS:
             prior = self.ledger.begin(request_id, method, fingerprint)
