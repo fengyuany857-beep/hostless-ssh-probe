@@ -49,9 +49,9 @@ class PostgresLedgerTests(unittest.TestCase):
         rid = self.rid("method")
         first = IdempotencyLedger(self.url)
         second = IdempotencyLedger(self.url)
-        self.assertIsNone(first.begin(rid, "write_file"))
+        self.assertIsNone(first.begin(rid, "write_file", "fp-a"))
         with self.assertRaises(PolicyError):
-            second.begin(rid, "exec")
+            second.begin(rid, "exec", "fp-b")
 
     def test_concurrent_begin_has_exactly_one_owner(self):
         rid = self.rid("concurrent")
