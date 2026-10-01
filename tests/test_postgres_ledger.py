@@ -47,12 +47,12 @@ class PostgresLedgerTests(unittest.TestCase):
 
     def test_concurrent_begin_has_exactly_one_owner(self):
         rid = self.rid("concurrent")
+        ledgers = [IdempotencyLedger(self.url) for _ in range(8)]
         barrier = threading.Barrier(8)
 
-        def attempt(_):
-            ledger = IdempotencyLedger(self.url)
+        def attempt(index):
             barrier.wait()
-            return ledger.begin(rid, "write_file")
+            return ledgers[index].begin(rid, "write_file")
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(attempt, range(8)))
