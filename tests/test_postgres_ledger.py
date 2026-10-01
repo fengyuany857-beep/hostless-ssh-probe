@@ -68,6 +68,15 @@ class PostgresLedgerTests(unittest.TestCase):
         self.assertEqual(sum(x is None for x in results), 1)
         self.assertEqual(sum(x is not None and x["state"] == "RUNNING" for x in results), 7)
 
+    def test_reconcile_hint_survives_new_instance(self):
+        rid = self.rid("hint")
+        hint = {"kind": "job", "job_id": "job_abcdefgh"}
+        first = IdempotencyLedger(self.url)
+        self.assertIsNone(first.begin(rid, "start_job", "fp-a", hint))
+        second = IdempotencyLedger(self.url)
+        record = second.get(rid)
+        self.assertEqual(record["reconcile_hint"], hint)
+
 
 if __name__ == "__main__":
     unittest.main()
