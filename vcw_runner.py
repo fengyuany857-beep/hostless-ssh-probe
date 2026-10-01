@@ -224,6 +224,11 @@ class Policy:
             raise PolicyError("invalid session_id")
         return value
 
+    def check_job_id(self, value: object) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"job_[A-Za-z0-9_-]{8,80}", value):
+            raise PolicyError("invalid job_id")
+        return value
+
     def timeout(self, value: object | None) -> float:
         if value is None:
             raise PolicyError("timeout_s is required when validating an explicit timeout")
@@ -286,6 +291,17 @@ class Policy:
         missing = sorted(required - set(value))
         if missing:
             raise PolicyError(f"missing required params for {method}: {','.join(missing)}")
+
+        if method in {"exec", "start_job"}:
+            self.argv(value.get("argv"))
+        if method in {"job_status", "cancel_job"}:
+            self.check_job_id(value.get("job_id"))
+        if method == "reconcile":
+            kind = value.get("kind")
+            if kind == "request":
+                self.check_request_id(value.get("target_request_id"))
+            elif kind == "job":
+                self.check_job_id(value.get("job_id"))
         return value
 
     def path(self, value: object) -> str:
@@ -793,7 +809,7 @@ class RunnerService:
         if method == "start_job":
             return {"kind": "job", "job_id": "job_" + hashlib.sha256(request_id.encode()).hexdigest()[:20]}
         if method == "cancel_job":
-            return {"kind": "job", "job_id": params.get("job_id")}
+            return {"kind": "job", "job_id": self.policy.check_job_id(params.get("job_id"))}
         if method == "apply_patch":
             patch = params.get("patch")
             touched = self.policy.patch_paths(patch)
@@ -981,8 +997,7 @@ class RunnerService:
                 pass
 
     def job_paths(self, job_id: object) -> dict[str, str]:
-        if not isinstance(job_id, str) or not re.fullmatch(r"job_[A-Za-z0-9_-]{8,80}", job_id):
-            raise PolicyError("invalid job_id")
+        job_id = self.policy.check_job_id(job_id)
         base = self.policy.path(f".vcw-runner/jobs/{job_id}")
         return {
             "base": base,
