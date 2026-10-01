@@ -68,10 +68,10 @@ def normalize_sha256_hex(value: object, field: str, *, allow_none: bool = False)
     return value.lower()
 
 
-def canonical_request_fingerprint(server_id: str, session_id: str | None, method: str, params: dict[str, Any]) -> str:
+def canonical_request_fingerprint(server_id: str, method: str, params: dict[str, Any]) -> str:
     try:
         raw = json.dumps(
-            {"server_id": server_id, "session_id": session_id, "method": method, "params": params},
+            {"server_id": server_id, "method": method, "params": params},
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -620,7 +620,7 @@ class RunnerService:
         params = body.get("params", {})
         if not isinstance(params, dict):
             raise PolicyError("params must be an object")
-        fingerprint = canonical_request_fingerprint(self.cfg.server_id, session_id, method, params)
+        fingerprint = canonical_request_fingerprint(self.cfg.server_id, method, params)
         if method in SIDE_EFFECTS:
             prior = self.ledger.begin(request_id, method, fingerprint)
             if prior and prior["response"] is not None:
