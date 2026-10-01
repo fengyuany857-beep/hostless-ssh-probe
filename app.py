@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
+import os
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from vcw_runner import Config, PolicyError, RPC_VERSION, RunnerService
@@ -11,6 +14,25 @@ from vcw_runner import Config, PolicyError, RPC_VERSION, RunnerService
 CFG = Config.from_env()
 SERVICE = RunnerService(CFG)
 INFLIGHT = threading.BoundedSemaphore(CFG.max_inflight)
+
+
+def runtime_build_fingerprint() -> str:
+    digest = hashlib.sha256()
+    base = Path(__file__).resolve().parent
+    for name in ("app.py", "vcw_runner.py", "channel_exec.py", "requirements.txt"):
+        path = base / name
+        data = path.read_bytes()
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(len(data)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+BUILD_FINGERPRINT = runtime_build_fingerprint()
+BUILD_REVISION = os.environ.get("VCW_RUNNER_BUILD_REVISION", "").strip() or None
 
 
 def reject_nonstandard_json_constant(value: str):
@@ -47,7 +69,7 @@ class Handler(BaseHTTPRequestHandler):
                 probe = SERVICE.backend.probe()
                 if self.path == "/probe":
                     return self._json(200, probe)
-                return self._json(200, {"ok": True, "rpc_version": RPC_VERSION, "server_id": CFG.server_id, "connection_generation": SERVICE.backend.generation, "backend": probe, "idempotency_ledger": {"backend": SERVICE.ledger.backend, "durable": SERVICE.ledger.durable}, "tools": sorted(CFG.allowed_tools)})
+                return self._json(200, {"ok": True, "rpc_version": RPC_VERSION, "server_id": CFG.server_id, "connection_generation": SERVICE.backend.generation, "backend": probe, "idempotency_ledger": {"backend": SERVICE.ledger.backend, "durable": SERVICE.ledger.durable}, "build": {"fingerprint_sha256": BUILD_FINGERPRINT, "revision": BUILD_REVISION}, "tools": sorted(CFG.allowed_tools)})
             except Exception as exc:
                 return self._json(503, {"ok": False, "error": type(exc).__name__, "message": str(exc)})
         return self._json(404, {"ok": False, "error": "not found"})
@@ -127,5 +149,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    audit("runner.start", server_id=CFG.server_id, port=CFG.port)
+    audit("runner.start", server_id=CFG.server_id, port=CFG.port, build_fingerprint_sha256=BUILD_FINGERPRINT, build_revision=BUILD_REVISION)
     ThreadingHTTPServer(("0.0.0.0", CFG.port), Handler).serve_forever()
