@@ -228,6 +228,8 @@ class IdempotencyLedger:
             connect_timeout=5,
             prepare_threshold=None,
             autocommit=True,
+            options="-c lock_timeout=5000 -c statement_timeout=10000",
+            application_name="vcw_remote_runner",
         )
 
     @staticmethod
