@@ -6,6 +6,10 @@ on:
       - vcw-remote-runner-v1
   pull_request:
 
+concurrency:
+  group: runner-tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   unit:
     runs-on: ubuntu-latest
