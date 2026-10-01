@@ -155,6 +155,19 @@ def main():
     wrong = curl_call("/v1/info", auth="bad")
     record("wrong_bearer_rejected", wrong["http"] == 401, {"http": wrong["http"]})
 
+    # Unique body canary for later Hostless log redaction scan.
+    audit_canary = "VCW_AUDIT_CANARY_" + hashlib.sha256((RUN + build.get("fingerprint_sha256", "")).encode()).hexdigest()[:20]
+    audit_rel = f"live-audit-canary-{RUN}.txt"
+    audit_path = PROJECT_ROOT / audit_rel
+    ARTIFACTS.append(audit_path)
+    audit_write = rpc("write_file", {"path": audit_rel, "content": audit_canary + "\n"}, "audit-canary")
+    record(
+        "audit_canary_write",
+        is_status(audit_write, "VERIFIED") and local_bytes(audit_rel) == (audit_canary + "\n").encode(),
+        {"status": payload(audit_write).get("status"), "path": audit_rel},
+        note="later search Hostless logs for audit_canary; any hit is a redaction failure",
+    )
+
     injected = curl_call("/v1/rpc", {
         "server_id": SERVER_ID,
         "request_id": f"live-{RUN}-envelope",
@@ -378,6 +391,7 @@ def main():
         "server_id": SERVER_ID,
         "build": build,
         "ledger": ledger,
+        "audit_canary": audit_canary,
         "passed": sum(1 for x in RESULTS if x["pass"]),
         "total": len(RESULTS),
         "failed": [x["name"] for x in RESULTS if not x["pass"]],
