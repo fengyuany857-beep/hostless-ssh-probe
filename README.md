@@ -1,12 +1,84 @@
-# Hostless SSH outbound probe
+# VCW Remote Runner
 
-Environment variables:
-- `TARGET_HOST`: fixed target VPS hostname/IP
-- `TARGET_PORT`: defaults to `22`
-- `PROBE_TOKEN`: random secret used to authorize `/probe`
+This repository is being upgraded from a Hostless SSH connectivity probe into **VCW Remote Runner v1**.
 
-Hostless provides `PORT` automatically.
+Target architecture:
 
-Endpoints:
-- `GET /health` -> always 200 while app is alive
-- `GET /probe` with `Authorization: Bearer <PROBE_TOKEN>` -> tests only TARGET_HOST:TARGET_PORT
+```text
+GPT
+  -> Front MCP
+  -> Execution Director
+  -> VCW V2 Gateway
+  -> VCW Remote Runner (this repository, hosted on Hostless)
+  -> SSH/SFTP
+  -> target VPS project
+```
+
+The Runner is deliberately **not an agent**. It performs deterministic, policy-checked actions and returns deterministic state. Bug diagnosis, code design, semantic repair decisions and strategy remain above this layer.
+
+## RPC v1
+
+Methods:
+
+- `read_file`
+- `write_file`
+- `apply_patch`
+- `exec`
+- `start_job`
+- `job_status`
+- `cancel_job`
+- `transfer`
+- `reconcile`
+
+States:
+
+- `VERIFIED`
+- `FAILED`
+- `OUTCOME_UNKNOWN`
+- `DENIED`
+- `RATE_LIMITED`
+
+See `docs/rpc-v1.md` for the contract.
+
+## Required environment
+
+- `RUNNER_TOKEN`
+- `VCW_SERVER_ID`
+- `TARGET_HOST`
+- `TARGET_PORT` (default `22`)
+- `TARGET_USER`
+- `VCW_PROJECT_ROOT`
+- `SSH_PRIVATE_KEY` or `SSH_PRIVATE_KEY_B64`
+- `SSH_HOST_KEY_SHA256`
+
+Optional:
+
+- `VCW_ALLOWED_TOOLS`
+- `VCW_ALLOWED_EXEC`
+- `VCW_BACKEND_TIMEOUT_S`
+- `VCW_MAX_FILE_BYTES`
+- `VCW_MAX_OUTPUT_BYTES`
+- `VCW_MAX_INFLIGHT`
+- `VCW_STATE_DB`
+- `PORT` from Hostless
+
+## Endpoints
+
+- `GET /health`: process liveness
+- `GET /v1/info`: authenticated Runner/backend capability check
+- `GET /probe`: authenticated compatibility probe
+- `POST /v1/rpc`: authenticated Runner RPC
+
+The RPC never accepts a host, port or username from the caller.
+
+## Security boundary
+
+The target SSH account is part of the isolation model. Runner argv filtering is not a complete host filesystem sandbox. Use a dedicated Unix account whose permissions expose only the intended project and required toolchain.
+
+Writes support CAS, SFTP temp files, atomic `posix_rename` and read-back SHA256 verification. SSH server identity is pinned with `SSH_HOST_KEY_SHA256`.
+
+## Current status
+
+Hostless -> target VPS TCP/22 reachability has already been proven. This branch upgrades the probe into the formal Runner API implementation.
+
+Before freezing `vcw.runner.v1`, perform real Hostless SSH/SFTP acceptance against the target VPS, including host-key rejection, CAS conflict, timeout/reconnect, job cancel, connection-generation change, transfer integrity and `OUTCOME_UNKNOWN` reconciliation cases.
