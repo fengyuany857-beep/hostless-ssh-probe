@@ -490,6 +490,30 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(hint["sha256"], __import__("hashlib").sha256(b"hello").hexdigest())
         self.assertEqual(ledger.hint, hint)
 
+    def test_exec_transport_loss_is_uncertain_and_resets_connection(self):
+        policy = Policy("/srv/project", frozenset({"exec"}), frozenset({"python3"}))
+        cfg = SimpleNamespace(
+            backend_timeout_s=1,
+            max_output_bytes=1024,
+            exec_path="/usr/bin:/bin",
+        )
+        backend = SSHBackend(cfg, policy)
+        backend.connect = lambda: object()
+        reset = {"count": 0}
+        backend.reset = lambda: reset.__setitem__("count", reset["count"] + 1)
+
+        old_runner = vr.run_command_channel
+        try:
+            def fail_transport(*args, **kwargs):
+                raise vr.paramiko.SSHException("connection lost")
+            vr.run_command_channel = fail_transport
+            with self.assertRaisesRegex(BackendUncertain, "remote command outcome is unknown"):
+                backend.internal_exec("true", 1)
+        finally:
+            vr.run_command_channel = old_runner
+
+        self.assertEqual(reset["count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
