@@ -938,7 +938,7 @@ class RunnerService:
 
     def rpc_exec(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         argv = self.policy.argv(p.get("argv"))
-        cwd = self.policy.cwd(p.get("cwd"))
+        cwd = self.backend.canonical_existing_path(self.policy.cwd(p.get("cwd")))
         r = self.backend.exec_argv(argv, cwd, p.get("timeout_s"))
         status = "VERIFIED" if r.exit_code == 0 else "FAILED"
         return self.response(rid, status, {"argv": argv, "cwd": cwd, "exit_code": r.exit_code, "stdout": r.stdout, "stderr": r.stderr}, None if status == "VERIFIED" else "NONZERO_EXIT", None if status == "VERIFIED" else f"command exited {r.exit_code}")
