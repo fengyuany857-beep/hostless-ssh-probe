@@ -151,9 +151,11 @@ class ContractTests(unittest.TestCase):
             generation = 1
             def __init__(self):
                 self.exec_calls = 0
+            def canonical_user_target(self, path):
+                return "/srv/project/" + path
             def internal_exec(self, command, timeout_s=None):
                 return ExecResult(0, "", "")
-            def write_bytes_cas(self, path, data, expected):
+            def write_bytes_cas(self, path, data, expected, **kwargs):
                 return {"ok": True, "sha256": "a" * 64, "previous_sha256": None, "bytes": len(data)}
             def exec_argv(self, argv, cwd, timeout_s=None):
                 self.exec_calls += 1
