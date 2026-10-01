@@ -775,7 +775,22 @@ class SSHBackend:
 
     def internal_exec(self, command: str, timeout_s: float | None = None) -> ExecResult:
         timeout = float(timeout_s or self.cfg.backend_timeout_s)
-        command = "PATH={}; export PATH; {}".format(shlex.quote(self.cfg.exec_path), command)
+        runtime_home = self.policy.path(".vcw-runner/runtime-home")
+        cache_home = posixpath.join(runtime_home, ".cache")
+        npm_cache = posixpath.join(runtime_home, ".npm")
+        command = (
+            "umask 077; "
+            "mkdir -p -- {home} {cache} {npm}; "
+            "HOME={home}; XDG_CACHE_HOME={cache}; NPM_CONFIG_CACHE={npm}; PATH={path}; "
+            "export HOME XDG_CACHE_HOME NPM_CONFIG_CACHE PATH; "
+            "{command}"
+        ).format(
+            home=shlex.quote(runtime_home),
+            cache=shlex.quote(cache_home),
+            npm=shlex.quote(npm_cache),
+            path=shlex.quote(self.cfg.exec_path),
+            command=command,
+        )
         with self.lock:
             try:
                 code, out, err = run_command_channel(
