@@ -503,7 +503,7 @@ class IdempotencyLedger:
             with self._pg_connect() as conn:
                 cur = conn.execute(
                     "UPDATE vcw_runner_idempotency_v1 SET state=%s,response_json=%s,updated_at=%s "
-                    "WHERE request_id=%s",
+                    "WHERE request_id=%s AND state='RUNNING'",
                     (status, payload, now, request_id),
                 )
                 if cur.rowcount != 1:
@@ -513,7 +513,7 @@ class IdempotencyLedger:
         with self.lock, self._sqlite_connect() as conn:
             cur = conn.execute(
                 "UPDATE vcw_runner_idempotency_v1 SET state=?,response_json=?,updated_at=? "
-                "WHERE request_id=?",
+                "WHERE request_id=? AND state='RUNNING'",
                 (status, payload, now, request_id),
             )
             if cur.rowcount != 1:
@@ -828,17 +828,22 @@ class RunnerService:
                     f"idempotency ledger unavailable before execution: {type(exc).__name__}",
                 )
                 return correlate_response(unavailable, session_id)
-            if prior and prior["response"] is not None:
-                return correlate_response(prior["response"], session_id)
-            if prior and prior["state"] == "RUNNING":
-                running = self.response(
+            if prior:
+                if prior["response"] is not None:
+                    return correlate_response(prior["response"], session_id)
+                code = "REQUEST_ALREADY_IN_FLIGHT" if prior["state"] == "RUNNING" else "REQUEST_INCOMPLETE"
+                message = "reconcile before retrying" if prior["state"] == "RUNNING" else "existing request record has no terminal response"
+                incomplete = self.response(
                     request_id,
                     "OUTCOME_UNKNOWN",
-                    {"reconcile_hint": prior.get("reconcile_hint")},
-                    code="REQUEST_ALREADY_IN_FLIGHT",
-                    message="reconcile before retrying",
+                    {
+                        "stored_state": prior["state"],
+                        "reconcile_hint": prior.get("reconcile_hint"),
+                    },
+                    code=code,
+                    message=message,
                 )
-                return correlate_response(running, session_id)
+                return correlate_response(incomplete, session_id)
         try:
             result = getattr(self, f"rpc_{method}")(request_id, params)
         except PolicyError as exc:
