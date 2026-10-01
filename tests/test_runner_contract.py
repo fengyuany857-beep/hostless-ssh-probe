@@ -585,7 +585,7 @@ class ContractTests(unittest.TestCase):
         try:
             def capture(client, command, **kwargs):
                 seen["command"] = command
-                return 0, "", ""
+                return 0, b"", b""
             vr.run_command_channel = capture
             result = backend.internal_exec("python3 -V", 1)
         finally:
