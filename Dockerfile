@@ -5,5 +5,6 @@ RUN pip install --no-cache-dir -r /app/requirements.txt \
     && useradd --uid 65532 --create-home --shell /usr/sbin/nologin runner
 COPY app.py /app/app.py
 COPY vcw_runner.py /app/vcw_runner.py
+COPY channel_exec.py /app/channel_exec.py
 USER 65532:65532
 CMD ["python", "/app/app.py"]
