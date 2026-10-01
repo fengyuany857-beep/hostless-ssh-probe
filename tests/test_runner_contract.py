@@ -22,12 +22,14 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(policy.timeout(0.25), 0.25)
         self.assertEqual(policy.timeout(999), 300.0)
 
-    def test_request_fingerprint_binds_session_and_params(self):
-        a = canonical_request_fingerprint("srv", "ses-a", "write_file", {"path": "a", "content": "x"})
-        b = canonical_request_fingerprint("srv", "ses-b", "write_file", {"path": "a", "content": "x"})
-        c = canonical_request_fingerprint("srv", "ses-a", "write_file", {"path": "a", "content": "y"})
-        self.assertNotEqual(a, b)
-        self.assertNotEqual(a, c)
+    def test_request_fingerprint_binds_action_not_session_correlation(self):
+        a = canonical_request_fingerprint("srv", "write_file", {"path": "a", "content": "x"})
+        same = canonical_request_fingerprint("srv", "write_file", {"content": "x", "path": "a"})
+        changed = canonical_request_fingerprint("srv", "write_file", {"path": "a", "content": "y"})
+        other_method = canonical_request_fingerprint("srv", "transfer", {"path": "a", "content": "x"})
+        self.assertEqual(a, same)
+        self.assertNotEqual(a, changed)
+        self.assertNotEqual(a, other_method)
 
     def test_ledger_finish_failure_becomes_outcome_unknown(self):
         service = RunnerService.__new__(RunnerService)
