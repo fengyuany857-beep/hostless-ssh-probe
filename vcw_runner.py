@@ -217,10 +217,14 @@ class PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
         self.expected = expected.rstrip("=")
 
     def missing_host_key(self, client, hostname, key):
+        algorithm = key.get_name()
         got = base64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
         if got != self.expected:
-            raise paramiko.SSHException(f"host key mismatch for {hostname}")
-        client.get_host_keys().add(hostname, key.get_name(), key)
+            raise paramiko.SSHException(
+                f"host key mismatch for {hostname}: algorithm={algorithm} "
+                f"got=SHA256:{got} expected=SHA256:{self.expected}"
+            )
+        client.get_host_keys().add(hostname, algorithm, key)
 
 
 def load_private_key(text: str) -> paramiko.PKey:
