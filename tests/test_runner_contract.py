@@ -3,10 +3,12 @@ import unittest
 from types import SimpleNamespace
 
 from vcw_runner import (
+    BackendUncertain,
     ExecResult,
     Policy,
     PolicyError,
     RunnerService,
+    SSHBackend,
     canonical_request_fingerprint,
 )
 
@@ -85,6 +87,75 @@ class ContractTests(unittest.TestCase):
         result = service.rpc_cancel_job("req", {"job_id": "job_abcdefgh"})
         self.assertEqual(result["status"], "OUTCOME_UNKNOWN")
         self.assertEqual(result["error"]["code"], "JOB_IDENTITY_UNKNOWN")
+
+    def test_sftp_rename_failure_is_uncertain(self):
+        policy = Policy("/srv/project", frozenset({"write_file"}), frozenset())
+        cfg = SimpleNamespace(max_file_bytes=1024)
+
+        class RemoteFile:
+            def __init__(self):
+                self.data = bytearray()
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def write(self, data):
+                self.data.extend(data)
+            def flush(self):
+                pass
+
+        class Sftp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def normalize(self, path):
+                return path
+            def lstat(self, path):
+                raise FileNotFoundError(path)
+            def open(self, path, mode):
+                return RemoteFile()
+            def posix_rename(self, src, dst):
+                raise OSError("connection lost during rename")
+            def remove(self, path):
+                pass
+
+        class Client:
+            def open_sftp(self):
+                return Sftp()
+
+        backend = SSHBackend(cfg, policy)
+        backend.connect = lambda: Client()
+        backend.reset = lambda: None
+
+        with self.assertRaisesRegex(BackendUncertain, "rename outcome is unknown"):
+            backend.write_bytes_cas("/srv/project/a.txt", b"x", None)
+
+    def test_patch_requires_independent_postcondition(self):
+        service = RunnerService.__new__(RunnerService)
+        service.cfg = SimpleNamespace(project_root="/srv/project", backend_timeout_s=5, server_id="srv")
+        service.policy = Policy("/srv/project", frozenset({"apply_patch"}), frozenset({"git"}))
+
+        class Backend:
+            generation = 1
+            def __init__(self):
+                self.exec_calls = 0
+            def internal_exec(self, command, timeout_s=None):
+                return ExecResult(0, "", "")
+            def write_bytes_cas(self, path, data, expected):
+                return {"ok": True, "sha256": "a" * 64, "previous_sha256": None, "bytes": len(data)}
+            def exec_argv(self, argv, cwd, timeout_s=None):
+                self.exec_calls += 1
+                if self.exec_calls <= 2:
+                    return ExecResult(0, "", "")
+                return ExecResult(1, "", "reverse check failed")
+
+        service.backend = Backend()
+        service.response = RunnerService.response.__get__(service, RunnerService)
+        patch = "--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+x\n"
+        result = service.rpc_apply_patch("req", {"patch": patch})
+        self.assertEqual(result["status"], "OUTCOME_UNKNOWN")
+        self.assertEqual(result["error"]["code"], "PATCH_POSTCONDITION_UNVERIFIED")
 
 
 if __name__ == "__main__":
