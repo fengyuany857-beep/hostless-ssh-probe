@@ -37,6 +37,16 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(self.p.argv(['git','status']), ['git','status'])
         with self.assertRaises(PolicyError):
             self.p.argv(['bash','-lc','cat /etc/passwd'])
+        with self.assertRaisesRegex(PolicyError, "bare executable name"):
+            self.p.argv(['/tmp/fake/git','status'])
+
+    def test_method_params_reject_unknown_fields(self):
+        self.assertEqual(
+            self.p.params('read_file', {'path': 'a.txt'}),
+            {'path': 'a.txt'},
+        )
+        with self.assertRaisesRegex(PolicyError, "unsupported params"):
+            self.p.params('read_file', {'path': 'a.txt', 'host': '127.0.0.1'})
 
     def test_patch_escape_denied(self):
         with self.assertRaises(PolicyError):
