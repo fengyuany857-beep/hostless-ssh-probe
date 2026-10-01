@@ -17,7 +17,7 @@ fake.SSHClient = object
 fake.SSHException = RuntimeError
 sys.modules.setdefault('paramiko', fake)
 
-from vcw_runner import Policy, PolicyError, normalize_host_key_sha256
+from vcw_runner import Policy, PolicyError, SSHBackend, normalize_host_key_sha256
 
 class PolicyTests(unittest.TestCase):
     def setUp(self):
@@ -52,6 +52,30 @@ class PolicyTests(unittest.TestCase):
     def test_host_key_sha256_rejects_invalid(self):
         with self.assertRaises(RuntimeError):
             normalize_host_key_sha256('sha256:not-a-fingerprint')
+
+    def test_write_rejects_symlink_leaf_before_following_it(self):
+        policy = Policy('/srv/projects/demo', frozenset({'write_file'}), frozenset())
+        cfg = SimpleNamespace(max_file_bytes=1024)
+
+        class FakeSftp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def normalize(self, path):
+                return path
+            def lstat(self, path):
+                return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777)
+
+        class FakeClient:
+            def open_sftp(self):
+                return FakeSftp()
+
+        backend = SSHBackend(cfg, policy)
+        backend.connect = lambda: FakeClient()
+
+        with self.assertRaisesRegex(PolicyError, 'refusing to overwrite symlink'):
+            backend.write_bytes_cas('/srv/projects/demo/link.txt', b'x', None)
 
 if __name__ == '__main__':
     unittest.main()
