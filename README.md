@@ -59,13 +59,14 @@ Optional:
 - `VCW_MAX_FILE_BYTES`
 - `VCW_MAX_OUTPUT_BYTES`
 - `VCW_MAX_INFLIGHT`
-- `VCW_STATE_DB`
+- `VCW_STATE_DATABASE_URL` (recommended for Hostless production; PostgreSQL)
+- `VCW_STATE_DB` (SQLite fallback for local/dev only)
 - `PORT` from Hostless
 
 ## Endpoints
 
 - `GET /health`: process liveness
-- `GET /v1/info`: authenticated Runner/backend capability check
+- `GET /v1/info`: authenticated Runner/backend capability check, including state-store backend/durability
 - `GET /probe`: authenticated compatibility probe
 - `POST /v1/rpc`: authenticated Runner RPC
 
@@ -76,6 +77,8 @@ The RPC never accepts a host, port or username from the caller.
 The target SSH account is part of the isolation model. Runner argv filtering is not a complete host filesystem sandbox. Use a dedicated Unix account whose permissions expose only the intended project and required toolchain.
 
 Writes support CAS, SFTP temp files, atomic `posix_rename` and read-back SHA256 verification. SSH server identity is pinned with `SSH_HOST_KEY_SHA256`.
+
+For production idempotency across Hostless redeploys, link a managed PostgreSQL database and inject its connection string as `VCW_STATE_DATABASE_URL`. The Runner stores only request-ledger metadata and serialized RPC responses there. If that variable is absent, the Runner falls back to `VCW_STATE_DB` SQLite; the default `/tmp/vcw-runner.sqlite3` is restart-local and must not be used for a frozen production Runner.
 
 ## Current status
 
