@@ -121,6 +121,12 @@ def normalize_host_key_sha256(value: str) -> str:
     value = value.rstrip("=")
     if not re.fullmatch(r"[A-Za-z0-9+/]{43}", value):
         raise RuntimeError("SSH_HOST_KEY_SHA256 must be a SHA256 host-key fingerprint")
+    try:
+        decoded = base64.b64decode(value + "=", validate=True)
+    except Exception as exc:
+        raise RuntimeError("SSH_HOST_KEY_SHA256 must be a SHA256 host-key fingerprint") from exc
+    if len(decoded) != 32:
+        raise RuntimeError("SSH_HOST_KEY_SHA256 must decode to 32 bytes")
     return value
 
 
@@ -161,6 +167,11 @@ class Config:
         token = os.environ.get("RUNNER_TOKEN", "").strip()
         if not token:
             raise RuntimeError("RUNNER_TOKEN is required")
+        if len(token) < 32:
+            raise RuntimeError("RUNNER_TOKEN must be at least 32 characters")
+        server_id = _required("VCW_SERVER_ID")
+        if not SAFE_ID.fullmatch(server_id):
+            raise RuntimeError("VCW_SERVER_ID must match the RPC safe-id syntax")
         target_port = int(os.environ.get("TARGET_PORT", "22"))
         port = int(os.environ.get("PORT", "8080"))
         if not 1 <= target_port <= 65535:
@@ -176,7 +187,7 @@ class Config:
             raise RuntimeError("VCW_MAX_INFLIGHT must be between 1 and 128")
         cfg = cls(
             runner_token=token,
-            server_id=_required("VCW_SERVER_ID"),
+            server_id=server_id,
             target_host=_required("TARGET_HOST"),
             target_port=target_port,
             target_user=target_user,
