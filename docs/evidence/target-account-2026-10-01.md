@@ -71,41 +71,25 @@ Project root:
 /srv/vcw-runner-test read=yes write=yes
 ```
 
-## P0 finding: authentication and shell-startup state are user-writable
+## P0 finding and remediation outcome
 
-Direct writeability probes returned:
-
-```text
-/home/vcwrunner                              write=yes
-/home/vcwrunner/.ssh                         write=yes
-/home/vcwrunner/.ssh/authorized_keys         write=yes
-```
-
-Effective sshd settings for `vcwrunner` before remediation include:
+Initial read-only audit found that `vcwrunner` could write:
 
 ```text
-authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2
-passwordauthentication yes
-pubkeyauthentication yes
-permituserrc yes
-permittty yes
-allowtcpforwarding yes
-disableforwarding no
-x11forwarding yes
-authenticationmethods any
+/home/vcwrunner
+/home/vcwrunner/.ssh
+/home/vcwrunner/.ssh/authorized_keys
 ```
 
-The current key's inline `restrict` option does disable forwarding/PTY/user rc for that key, but the authentication source itself is owned and writable by the target account.
+This made the inline `restrict` option insufficient as a durable account boundary because an allowed interpreter could modify the account's own SSH authentication/startup state.
 
-Because Runner intentionally permits powerful executables such as `python3` and `node`, a caller that reaches an allowed exec action could modify `~/.ssh/authorized_keys` or shell startup files outside `VCW_PROJECT_ROOT`. It could then create persistent account-level behavior or add another SSH key without the current inline restrictions.
+The finding was treated as P0 and the earlier least-privilege PASS was retracted.
 
-Therefore the earlier least-privilege PASS is retracted.
+### Applied remediation
 
-Current target-account isolation state: FAIL / P0 until the authentication source and shell startup state are removed from `vcwrunner` write control.
+Authorized action scope: harden only the `vcwrunner` SSH authentication/home boundary, reload sshd, verify a fresh SSH login, and verify rollback.
 
-## Proposed hardening, syntax-validated but not applied
-
-A temporary sshd configuration was syntax-checked successfully with this user-specific policy:
+Final applied SSH user policy:
 
 ```text
 Match User vcwrunner
@@ -122,22 +106,105 @@ Match User vcwrunner
 Match all
 ```
 
-The effective temporary configuration resolved to the expected user-specific values.
+Final authentication source:
 
-Required filesystem side of the remediation:
+```text
+root root 755 /etc/ssh/vcw-authorized-keys
+root root 644 /etc/ssh/vcw-authorized-keys/vcwrunner
+```
 
-- move/copy the accepted public key to a root-owned file outside the user's writable home;
-- make `/home/vcwrunner` and its shell startup/SSH metadata root-owned and non-writable by `vcwrunner`;
-- keep `/srv/vcw-runner-test` writable by `vcwrunner`;
-- validate `sshd -t` before reload;
-- prove a new key-authenticated `vcwrunner` SSH command still works after reload;
-- prove `vcwrunner` can no longer modify the authentication source or shell startup state.
+The file is public-key material, not a secret. Mode `0644` is required for sshd's authentication read path on this host while remaining non-writable by `vcwrunner`.
 
-Runner code now prepares for an unwritable real home by setting command `HOME`, XDG cache, and npm cache to protected project-local Runner metadata before invoking tool commands. A real-host regression must be rerun after the account hardening is applied.
+Final real-home state:
 
-## Toolchain compatibility precheck
+```text
+root vcwrunner 750 /home/vcwrunner
+root root      700 /home/vcwrunner/.ssh
+root root      600 /home/vcwrunner/.ssh/authorized_keys
+```
 
-With command `HOME` and caches pointed to project-local Runner metadata, the target account successfully executed:
+Effective writeability as `vcwrunner`:
+
+```text
+/home/vcwrunner                              write=no
+/home/vcwrunner/.ssh                         write=no
+/home/vcwrunner/.ssh/authorized_keys         write=no
+/etc/ssh/vcw-authorized-keys/vcwrunner       write=no
+/srv/vcw-runner-test                         write=yes
+```
+
+The current public-key fingerprint remained:
+
+```text
+SHA256:5HYVX64bndjEBFrOWfPBgb64RylwM5Ei3Zz7zHTRz/A
+```
+
+The fingerprint was independently matched against the public key derived from the Runner private key before mutation.
+
+### Reload and fresh-login verification
+
+`sshd -t` passed before reload.
+
+After reload:
+
+```text
+service = active
+pubkeyauthentication yes
+passwordauthentication no
+kbdinteractiveauthentication no
+x11forwarding no
+permittty no
+permituserrc no
+disableforwarding yes
+authorizedkeysfile /etc/ssh/vcw-authorized-keys/%u
+authenticationmethods publickey
+permittunnel no
+```
+
+A completely new key-authenticated SSH command succeeded first via `127.0.0.1:22` and then via the actual Runner target address `210.126.235.162:22`.
+
+The remote session observed UID `1001`, no write access to the real home/authentication source, and write access to the intended project root.
+
+Result: PASS.
+
+### First-attempt failure and automatic rollback
+
+The first hardening attempt installed the external public-key file as root-owned `0600`. sshd logged:
+
+```text
+Could not open user 'vcwrunner' authorized keys '/etc/ssh/vcw-authorized-keys/vcwrunner': Permission denied
+```
+
+The action wrapper detected the failed fresh-login test and automatically restored the original sshd drop-ins and original `/home/vcwrunner`, validated `sshd -t`, and reloaded sshd.
+
+The root cause was confirmed from the sshd journal before retrying. No blind retry was performed.
+
+The second attempt used root-owned `0644` for the public-key file and passed all post-conditions.
+
+### Rollback verification
+
+Successful hardening backup:
+
+```text
+/root/vcw-runner-hardening-backup-20261001T121005Z
+```
+
+Verified:
+
+- original sshd drop-ins are archived;
+- original `/home/vcwrunner` is archived with ownership/modes;
+- rollback script passes `bash -n`;
+- extracted home backup reproduces the original metadata manifest;
+- the backed-up pre-hardening sshd configuration was reconstructed in a temporary tree and passed `sshd -t`;
+- rollback does not require the new SSH authentication source to remain present.
+
+Rollback was rehearsed non-destructively after the successful deployment. The successful hardened state was intentionally left active.
+
+## Runner runtime-home compatibility
+
+Runner code prepares for the non-writable real home by setting command `HOME`, XDG cache, and npm cache to project-local Runner metadata before invoking tools.
+
+A direct compatibility precheck with project-local runtime home successfully executed:
 
 ```text
 git version 2.43.0
@@ -147,7 +214,9 @@ npm 10.8.2
 npx 10.8.2
 ```
 
-A before/after metadata snapshot showed no change under the real `/home/vcwrunner` during that precheck.
+The real `/home/vcwrunner` metadata remained unchanged during that precheck.
+
+The corresponding Runner regression test is part of the branch CI.
 
 ## Process sharing
 
@@ -157,11 +226,13 @@ At verification time, `ps -u vcwrunner` returned no unrelated running processes.
 
 - argv execution is not a filesystem sandbox;
 - sampled inaccessible paths do not prove the absence of every world-readable host path;
-- the hardening configuration above has been syntax/effective-config tested only, not applied;
+- the dedicated target account can still write the intended project and normal host temporary areas permitted by Unix permissions;
 - this evidence is point-in-time and must be rechecked after any account, sshd, key, group, sudoers, project ownership, or deployment-topology change.
 
 ## Conclusion
 
-Current target-account isolation terminal state: BLOCKED by the user-writable SSH authentication/home boundary.
+Current target-account isolation state: PASS within the bounded acceptance scope.
 
-Do not freeze Runner v1 until the P0 is remediated and independently read back.
+The prior P0 user-writable SSH authentication/home finding is remediated and directly read back.
+
+This evidence closes the target-account isolation gate only. It does not close durable Hostless PostgreSQL persistence, wrong-host-key injection, runtime audit-canary scanning, or final release freeze.
