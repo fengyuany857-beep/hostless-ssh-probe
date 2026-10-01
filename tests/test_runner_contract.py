@@ -570,6 +570,35 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(PolicyError):
             policy.user_path("/srv/project/.vcw-runner/tmp/x.patch")
 
+    def test_internal_exec_uses_project_local_runtime_home_and_umask(self):
+        policy = Policy("/srv/project", frozenset({"exec"}), frozenset({"python3"}))
+        cfg = SimpleNamespace(
+            backend_timeout_s=2,
+            max_output_bytes=1024,
+            exec_path="/usr/bin:/bin",
+        )
+        backend = SSHBackend(cfg, policy)
+        backend.connect = lambda: object()
+        seen = {}
+
+        old_runner = vr.run_command_channel
+        try:
+            def capture(client, command, **kwargs):
+                seen["command"] = command
+                return 0, "", ""
+            vr.run_command_channel = capture
+            result = backend.internal_exec("python3 -V", 1)
+        finally:
+            vr.run_command_channel = old_runner
+
+        self.assertEqual(result.exit_code, 0)
+        command = seen["command"]
+        self.assertIn("umask 077", command)
+        self.assertIn("/srv/project/.vcw-runner/runtime-home", command)
+        self.assertIn("XDG_CACHE_HOME=", command)
+        self.assertIn("NPM_CONFIG_CACHE=", command)
+        self.assertIn("PATH=/usr/bin:/bin", command)
+
 
 if __name__ == "__main__":
     unittest.main()
