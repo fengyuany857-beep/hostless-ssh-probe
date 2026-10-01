@@ -86,7 +86,7 @@ Writes support compare-before-write CAS semantics, SFTP temp files, atomic `posi
 
 Caller executable paths are not accepted: `argv[0]` must be a bare name in `VCW_ALLOWED_EXEC`, resolved only through deployment-fixed `VCW_EXEC_PATH`. Exec/job cwd is canonically checked against the configured project root. This still does not replace least-privileged target-account isolation.
 
-For production idempotency across Hostless redeploys, link a managed PostgreSQL database and inject its connection string as `VCW_LEDGER_DATABASE_URL`. The Runner stores only request-ledger metadata and serialized RPC responses there. If that variable is absent, the Runner falls back to `VCW_LEDGER_DB` SQLite; the default `/tmp/vcw-runner-ledger.sqlite3` is restart-local and must not be used for a frozen production Runner.
+For production idempotency across Hostless redeploys, link a managed PostgreSQL database and inject its connection string as `VCW_LEDGER_DATABASE_URL`. PostgreSQL ledger statements run inside explicit transactions with transaction-local lock/statement timeouts; the connection avoids startup `options` so it remains compatible with Hostless's PgBouncer path. The Runner stores only request-ledger metadata and serialized RPC responses there. If that variable is absent, the Runner falls back to `VCW_LEDGER_DB` SQLite; the default `/tmp/vcw-runner-ledger.sqlite3` is restart-local and must not be used for a frozen production Runner.
 
 Authenticated `GET /v1/info` reports ledger durability and a SHA256 runtime build fingerprint over packaged Runner source/requirements so real-host evidence can be bound to the deployed build. `connection_generation` is a successful SSH connection epoch and increments once per new established connection.
 
