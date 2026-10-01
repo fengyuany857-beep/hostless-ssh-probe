@@ -293,8 +293,15 @@ class Policy:
             raise PolicyError("path escapes project root")
         return candidate
 
+    def user_path(self, value: object) -> str:
+        resolved = self.path(value)
+        rel = posixpath.relpath(resolved, self.root)
+        if rel in {".git", ".vcw-runner"} or rel.startswith(".git/") or rel.startswith(".vcw-runner/"):
+            raise PolicyError("path targets Runner/Git control metadata")
+        return resolved
+
     def cwd(self, value: object | None) -> str:
-        return self.path(self.root if value in (None, "") else value)
+        return self.user_path(self.root if value in (None, "") else value)
 
     def argv(self, value: object) -> list[str]:
         if not isinstance(value, list) or not value or not all(isinstance(x, str) and x for x in value):
@@ -323,7 +330,7 @@ class Policy:
             normalized = posixpath.normpath(raw)
             if raw.startswith("/") or normalized in {"", ".", ".."} or normalized.startswith("../"):
                 raise PolicyError("patch contains unsafe path")
-            self.path(normalized)
+            self.user_path(normalized)
             touched.add(normalized)
         if not touched:
             raise PolicyError("patch contains no file paths")
@@ -332,6 +339,7 @@ class Policy:
 
 class IdempotencyLedger:
     POSTGRES_PREFIXES = ("postgresql://", "postgres://")
+    TABLE = "vcw_runner_idempotency_v1"
 
     def __init__(self, target: str):
         self.target = target
@@ -348,7 +356,7 @@ class IdempotencyLedger:
             self._psycopg = psycopg
             with self._pg_connect() as conn:
                 conn.execute(
-                    "CREATE TABLE IF NOT EXISTS operations ("
+                    "CREATE TABLE IF NOT EXISTS vcw_runner_idempotency_v1 ("
                     "request_id TEXT PRIMARY KEY,"
                     "method TEXT NOT NULL,"
                     "state TEXT NOT NULL,"
@@ -357,12 +365,12 @@ class IdempotencyLedger:
                     "request_fingerprint TEXT"
                     ")"
                 )
-                conn.execute("ALTER TABLE operations ADD COLUMN IF NOT EXISTS request_fingerprint TEXT")
+                conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN IF NOT EXISTS request_fingerprint TEXT")
         else:
             Path(target).parent.mkdir(parents=True, exist_ok=True)
             with self._sqlite_connect() as conn:
                 conn.execute(
-                    "CREATE TABLE IF NOT EXISTS operations ("
+                    "CREATE TABLE IF NOT EXISTS vcw_runner_idempotency_v1 ("
                     "request_id TEXT PRIMARY KEY,"
                     "method TEXT NOT NULL,"
                     "state TEXT NOT NULL,"
@@ -371,9 +379,9 @@ class IdempotencyLedger:
                     "request_fingerprint TEXT"
                     ")"
                 )
-                columns = {row[1] for row in conn.execute("PRAGMA table_info(operations)")}
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(vcw_runner_idempotency_v1)")}
                 if "request_fingerprint" not in columns:
-                    conn.execute("ALTER TABLE operations ADD COLUMN request_fingerprint TEXT")
+                    conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN request_fingerprint TEXT")
 
     def _sqlite_connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.target, timeout=5)
@@ -408,7 +416,7 @@ class IdempotencyLedger:
             with self._pg_connect() as conn:
                 row = conn.execute(
                     "SELECT method,state,response_json,updated_at,request_fingerprint "
-                    "FROM operations WHERE request_id=%s",
+                    "FROM vcw_runner_idempotency_v1 WHERE request_id=%s",
                     (request_id,),
                 ).fetchone()
             return self._record(row)
@@ -416,7 +424,7 @@ class IdempotencyLedger:
         with self.lock, self._sqlite_connect() as conn:
             row = conn.execute(
                 "SELECT method,state,response_json,updated_at,request_fingerprint "
-                "FROM operations WHERE request_id=?",
+                "FROM vcw_runner_idempotency_v1 WHERE request_id=?",
                 (request_id,),
             ).fetchone()
         return self._record(row)
@@ -427,7 +435,7 @@ class IdempotencyLedger:
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
                 inserted = conn.execute(
-                    "INSERT INTO operations(request_id,method,state,updated_at,request_fingerprint) "
+                    "INSERT INTO vcw_runner_idempotency_v1(request_id,method,state,updated_at,request_fingerprint) "
                     "VALUES(%s,%s,'RUNNING',%s,%s) "
                     "ON CONFLICT (request_id) DO NOTHING "
                     "RETURNING request_id",
@@ -438,7 +446,7 @@ class IdempotencyLedger:
 
                 row = conn.execute(
                     "SELECT method,state,response_json,updated_at,request_fingerprint "
-                    "FROM operations WHERE request_id=%s",
+                    "FROM vcw_runner_idempotency_v1 WHERE request_id=%s",
                     (request_id,),
                 ).fetchone()
                 if not row:
@@ -457,7 +465,7 @@ class IdempotencyLedger:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT method,state,response_json,updated_at,request_fingerprint "
-                "FROM operations WHERE request_id=?",
+                "FROM vcw_runner_idempotency_v1 WHERE request_id=?",
                 (request_id,),
             ).fetchone()
             if row:
@@ -471,7 +479,7 @@ class IdempotencyLedger:
                     raise PolicyError("request_id already used for different request parameters")
                 return record
             conn.execute(
-                "INSERT INTO operations(request_id,method,state,updated_at,request_fingerprint) "
+                "INSERT INTO vcw_runner_idempotency_v1(request_id,method,state,updated_at,request_fingerprint) "
                 "VALUES(?,?,'RUNNING',?,?)",
                 (request_id, method, now, request_fingerprint),
             )
@@ -484,7 +492,7 @@ class IdempotencyLedger:
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
                 cur = conn.execute(
-                    "UPDATE operations SET state=%s,response_json=%s,updated_at=%s "
+                    "UPDATE vcw_runner_idempotency_v1 SET state=%s,response_json=%s,updated_at=%s "
                     "WHERE request_id=%s",
                     (status, payload, now, request_id),
                 )
@@ -494,7 +502,7 @@ class IdempotencyLedger:
 
         with self.lock, self._sqlite_connect() as conn:
             cur = conn.execute(
-                "UPDATE operations SET state=?,response_json=?,updated_at=? "
+                "UPDATE vcw_runner_idempotency_v1 SET state=?,response_json=?,updated_at=? "
                 "WHERE request_id=?",
                 (status, payload, now, request_id),
             )
@@ -549,7 +557,6 @@ class SSHBackend:
                 except Exception:
                     pass
             self.client = None
-            self.generation += 1
 
     def connect(self) -> paramiko.SSHClient:
         with self.lock:
@@ -571,6 +578,7 @@ class SSHBackend:
                 look_for_keys=False,
             )
             self.client = client
+            self.generation += 1
             return client
 
     def probe(self) -> dict[str, Any]:
@@ -805,7 +813,7 @@ class RunnerService:
         return correlate_response(result, session_id)
 
     def rpc_read_file(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
-        path = self.policy.path(p.get("path"))
+        path = self.policy.user_path(p.get("path"))
         data = self.backend.read_bytes(path)
         enc = p.get("encoding", "utf-8")
         if enc == "utf-8":
@@ -831,7 +839,7 @@ class RunnerService:
         raise PolicyError("encoding must be utf-8 or base64")
 
     def rpc_write_file(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
-        path = self.policy.path(p.get("path"))
+        path = self.policy.user_path(p.get("path"))
         data = self.decode_content(p)
         expected = normalize_sha256_hex(p.get("expected_sha256"), "expected_sha256", allow_none=True)
         result = self.backend.write_bytes_cas(path, data, expected)
@@ -1098,13 +1106,13 @@ class RunnerService:
             if content_sha is not None and sha256(data) != content_sha:
                 raise PolicyError("content_sha256 does not match upload payload")
             expected = normalize_sha256_hex(p.get("expected_sha256"), "expected_sha256", allow_none=True)
-            path = self.policy.path(p.get("path"))
+            path = self.policy.user_path(p.get("path"))
             result = self.backend.write_bytes_cas(path, data, expected)
             if not result["ok"]:
                 return self.response(rid, "FAILED", result, result["code"], "transfer CAS failed")
             return self.response(rid, "VERIFIED", {"direction": direction, "path": path, **result})
         if direction == "download":
-            path = self.policy.path(p.get("path"))
+            path = self.policy.user_path(p.get("path"))
             data = self.backend.read_bytes(path)
             return self.response(rid, "VERIFIED", {"direction": direction, "path": path, "encoding": "base64", "content": base64.b64encode(data).decode(), "sha256": sha256(data), "bytes": len(data)})
         raise PolicyError("transfer direction must be upload or download")
@@ -1144,7 +1152,7 @@ class RunnerService:
                 )
             return self.response(rid, "OUTCOME_UNKNOWN", {"target_request_id": target, "record": old}, "REQUEST_INCOMPLETE", "no terminal response")
         if kind == "file":
-            path = self.policy.path(p.get("path"))
+            path = self.policy.user_path(p.get("path"))
             expected = p.get("sha256")
             if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
                 raise PolicyError("sha256 is required for file reconciliation")
