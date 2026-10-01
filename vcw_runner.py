@@ -686,62 +686,239 @@ class RunnerService:
         mk = self.backend.internal_exec("mkdir -p -- " + shlex.quote(posixpath.dirname(remote)))
         if mk.exit_code != 0:
             raise BackendFailure("cannot create patch temp directory")
-        self.backend.write_bytes_cas(remote, data, None)
-        check = self.backend.exec_argv(["git", "apply", "--check", rel], self.cfg.project_root)
-        if check.exit_code != 0:
-            return self.response(rid, "FAILED", {"touched": touched, "patch_sha256": sha256(data), "stderr": check.stderr}, "PATCH_CHECK_FAILED", "git apply --check failed")
-        applied = self.backend.exec_argv(["git", "apply", "--whitespace=nowarn", rel], self.cfg.project_root)
-        if applied.exit_code != 0:
-            return self.response(rid, "OUTCOME_UNKNOWN", {"touched": touched, "patch_sha256": sha256(data), "stderr": applied.stderr}, "PATCH_APPLY_UNCERTAIN", "reconcile repository state")
-        return self.response(rid, "VERIFIED", {"touched": touched, "patch_sha256": sha256(data)})
+
+        try:
+            self.backend.write_bytes_cas(remote, data, None)
+            check = self.backend.exec_argv(["git", "apply", "--check", rel], self.cfg.project_root)
+            if check.exit_code != 0:
+                return self.response(
+                    rid,
+                    "FAILED",
+                    {"touched": touched, "patch_sha256": sha256(data), "stderr": check.stderr},
+                    "PATCH_CHECK_FAILED",
+                    "git apply --check failed",
+                )
+
+            applied = self.backend.exec_argv(["git", "apply", "--whitespace=nowarn", rel], self.cfg.project_root)
+            if applied.exit_code != 0:
+                return self.response(
+                    rid,
+                    "OUTCOME_UNKNOWN",
+                    {"touched": touched, "patch_sha256": sha256(data), "stderr": applied.stderr},
+                    "PATCH_APPLY_UNCERTAIN",
+                    "reconcile repository state",
+                )
+
+            verify = self.backend.exec_argv(["git", "apply", "--reverse", "--check", rel], self.cfg.project_root)
+            if verify.exit_code != 0:
+                return self.response(
+                    rid,
+                    "OUTCOME_UNKNOWN",
+                    {"touched": touched, "patch_sha256": sha256(data), "stderr": verify.stderr},
+                    "PATCH_POSTCONDITION_UNVERIFIED",
+                    "patch command returned success but reverse-check could not verify the applied post-condition",
+                )
+
+            return self.response(
+                rid,
+                "VERIFIED",
+                {"touched": touched, "patch_sha256": sha256(data), "postcondition": "reverse_apply_check"},
+            )
+        finally:
+            try:
+                self.backend.internal_exec("rm -f -- " + shlex.quote(remote), min(5.0, self.cfg.backend_timeout_s))
+            except Exception:
+                pass
 
     def job_paths(self, job_id: object) -> dict[str, str]:
         if not isinstance(job_id, str) or not re.fullmatch(r"job_[A-Za-z0-9_-]{8,80}", job_id):
             raise PolicyError("invalid job_id")
         base = self.policy.path(f".vcw-runner/jobs/{job_id}")
-        return {"base": base, "pid": base + "/pid", "exit": base + "/exit", "log": base + "/log", "cancelled": base + "/cancelled"}
+        return {
+            "base": base,
+            "pid": base + "/pid",
+            "start_ticks": base + "/start_ticks",
+            "boot_id": base + "/boot_id",
+            "exit": base + "/exit",
+            "log": base + "/log",
+            "cancelled": base + "/cancelled",
+        }
 
     def rpc_start_job(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         argv = self.policy.argv(p.get("argv"))
         cwd = self.policy.cwd(p.get("cwd"))
         job_id = "job_" + hashlib.sha256(rid.encode()).hexdigest()[:20]
         paths = self.job_paths(job_id)
-        inner = "cd -- {} && {}; rc=$?; printf '%s\\n' \"$rc\" > {}; exit \"$rc\"".format(shlex.quote(cwd), " ".join(shlex.quote(x) for x in argv), shlex.quote(paths["exit"]))
-        cmd = "mkdir -p -- {base} && if [ -f {pid} ]; then cat {pid}; else nohup setsid sh -c {inner} > {log} 2>&1 < /dev/null & pid=$!; printf '%s\\n' \"$pid\" > {pid}; printf '%s\\n' \"$pid\"; fi".format(base=shlex.quote(paths["base"]), pid=shlex.quote(paths["pid"]), inner=shlex.quote(inner), log=shlex.quote(paths["log"]))
+        inner = "cd -- {} && {}; rc=$?; printf '%s\\n' \"$rc\" > {}; exit \"$rc\"".format(
+            shlex.quote(cwd),
+            " ".join(shlex.quote(x) for x in argv),
+            shlex.quote(paths["exit"]),
+        )
+        cmd = (
+            "mkdir -p -- {base} && "
+            "if [ -f {pid} ]; then cat {pid}; "
+            "else "
+            "nohup setsid sh -c {inner} > {log} 2>&1 < /dev/null & pid=$!; "
+            "start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); "
+            "boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true); "
+            "if [ -z \"$start\" ] || [ -z \"$boot\" ]; then "
+            "kill -TERM -- -\"$pid\" 2>/dev/null || true; exit 45; fi; "
+            "printf '%s\\n' \"$pid\" > {pid}; "
+            "printf '%s\\n' \"$start\" > {start_ticks}; "
+            "printf '%s\\n' \"$boot\" > {boot_id}; "
+            "printf '%s\\n' \"$pid\"; "
+            "fi"
+        ).format(
+            base=shlex.quote(paths["base"]),
+            pid=shlex.quote(paths["pid"]),
+            start_ticks=shlex.quote(paths["start_ticks"]),
+            boot_id=shlex.quote(paths["boot_id"]),
+            inner=shlex.quote(inner),
+            log=shlex.quote(paths["log"]),
+        )
         r = self.backend.internal_exec(cmd)
         pid = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
         if r.exit_code != 0 or not pid.isdigit():
             raise BackendFailure("failed to start remote job")
-        return self.response(rid, "VERIFIED", {"job_id": job_id, "pid": int(pid), "state": "RUNNING", "argv": argv, "cwd": cwd})
+
+        observed = self.rpc_job_status(rid, {"job_id": job_id, "max_log_bytes": 0})
+        if observed["status"] != "VERIFIED":
+            return self.response(
+                rid,
+                "OUTCOME_UNKNOWN",
+                {"job_id": job_id, "pid": int(pid), "observed": observed.get("result")},
+                "JOB_START_UNCERTAIN",
+                "job metadata exists but current process identity/state could not be verified",
+            )
+        state = (observed.get("result") or {}).get("state")
+        return self.response(
+            rid,
+            "VERIFIED",
+            {"job_id": job_id, "pid": int(pid), "state": state, "argv": argv, "cwd": cwd},
+        )
 
     def rpc_job_status(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         job_id = p.get("job_id")
         paths = self.job_paths(job_id)
-        max_log = min(max(int(p.get("max_log_bytes", 32768)), 0), 131072)
-        cmd = "if [ -f {exitf} ]; then printf 'EXIT '; cat {exitf}; elif [ -f {pid} ]; then pid=$(cat {pid}); if kill -0 \"$pid\" 2>/dev/null; then printf 'RUNNING\\n'; else printf 'UNKNOWN\\n'; fi; else printf 'MISSING\\n'; fi; printf '%s\\n' '---LOG---'; if [ -f {log} ]; then tail -c {n} {log}; fi".format(exitf=shlex.quote(paths["exit"]), pid=shlex.quote(paths["pid"]), log=shlex.quote(paths["log"]), n=max_log)
+        try:
+            max_log = int(p.get("max_log_bytes", 32768))
+        except (TypeError, ValueError) as exc:
+            raise PolicyError("max_log_bytes must be an integer") from exc
+        max_log = min(max(max_log, 0), 131072)
+
+        cmd = (
+            "if [ -f {exitf} ]; then printf 'EXIT '; cat {exitf}; "
+            "elif [ -f {cancelled} ]; then printf 'CANCELLED\\n'; "
+            "elif [ -f {pid} ] && [ -f {start_ticks} ] && [ -f {boot_id} ]; then "
+            "pid=$(cat {pid}); expected_start=$(cat {start_ticks}); expected_boot=$(cat {boot_id}); "
+            "current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true); "
+            "if [ \"$current_boot\" != \"$expected_boot\" ]; then printf 'IDENTITY_MISMATCH\\n'; "
+            "elif [ ! -r /proc/$pid/stat ]; then printf 'UNKNOWN\\n'; "
+            "else current_start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); "
+            "if [ \"$current_start\" = \"$expected_start\" ] && kill -0 \"$pid\" 2>/dev/null; "
+            "then printf 'RUNNING\\n'; else printf 'IDENTITY_MISMATCH\\n'; fi; fi; "
+            "elif [ -f {pid} ]; then printf 'IDENTITY_MISSING\\n'; "
+            "else printf 'MISSING\\n'; fi; "
+            "printf '%s\\n' '---LOG---'; "
+            "if [ -f {log} ]; then tail -c {n} {log}; fi"
+        ).format(
+            exitf=shlex.quote(paths["exit"]),
+            cancelled=shlex.quote(paths["cancelled"]),
+            pid=shlex.quote(paths["pid"]),
+            start_ticks=shlex.quote(paths["start_ticks"]),
+            boot_id=shlex.quote(paths["boot_id"]),
+            log=shlex.quote(paths["log"]),
+            n=max_log,
+        )
         r = self.backend.internal_exec(cmd)
         if r.exit_code != 0:
             raise BackendFailure("job status query failed")
         head, _, log = r.stdout.partition("---LOG---\n")
         state = head.strip()
         if state.startswith("EXIT "):
-            code = int(state.split()[1])
-            return self.response(rid, "VERIFIED", {"job_id": job_id, "state": "SUCCEEDED" if code == 0 else "FAILED", "exit_code": code, "log_tail": log})
+            try:
+                code = int(state.split()[1])
+            except (IndexError, ValueError) as exc:
+                raise BackendFailure("invalid job exit metadata") from exc
+            return self.response(
+                rid,
+                "VERIFIED",
+                {"job_id": job_id, "state": "SUCCEEDED" if code == 0 else "FAILED", "exit_code": code, "log_tail": log},
+            )
+        if state == "CANCELLED":
+            return self.response(rid, "VERIFIED", {"job_id": job_id, "state": "CANCELLED", "log_tail": log})
         if state == "RUNNING":
             return self.response(rid, "VERIFIED", {"job_id": job_id, "state": "RUNNING", "log_tail": log})
         if state == "MISSING":
             return self.response(rid, "FAILED", {"job_id": job_id}, "JOB_NOT_FOUND", "job metadata not found")
-        return self.response(rid, "OUTCOME_UNKNOWN", {"job_id": job_id, "state": "UNKNOWN", "log_tail": log}, "JOB_STATE_UNKNOWN", "pid disappeared without exit record")
+        if state in {"IDENTITY_MISMATCH", "IDENTITY_MISSING"}:
+            return self.response(
+                rid,
+                "OUTCOME_UNKNOWN",
+                {"job_id": job_id, "state": "UNKNOWN", "log_tail": log},
+                "JOB_IDENTITY_UNKNOWN",
+                "stored PID cannot be safely bound to the original job process",
+            )
+        return self.response(
+            rid,
+            "OUTCOME_UNKNOWN",
+            {"job_id": job_id, "state": "UNKNOWN", "log_tail": log},
+            "JOB_STATE_UNKNOWN",
+            "pid disappeared without exit record",
+        )
 
     def rpc_cancel_job(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         job_id = p.get("job_id")
         paths = self.job_paths(job_id)
-        cmd = "test -f {pid} || exit 44; pid=$(cat {pid}); kill -TERM -- -\"$pid\" 2>/dev/null || true; sleep 2; kill -KILL -- -\"$pid\" 2>/dev/null || true; printf 'cancelled\\n' > {cancelled}".format(pid=shlex.quote(paths["pid"]), cancelled=shlex.quote(paths["cancelled"]))
+        cmd = (
+            "if [ ! -f {pid} ] || [ ! -f {start_ticks} ] || [ ! -f {boot_id} ]; then exit 44; fi; "
+            "pid=$(cat {pid}); expected_start=$(cat {start_ticks}); expected_boot=$(cat {boot_id}); "
+            "current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true); "
+            "if [ \"$current_boot\" != \"$expected_boot\" ] || [ ! -r /proc/$pid/stat ]; then exit 45; fi; "
+            "current_start=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null || true); "
+            "if [ \"$current_start\" != \"$expected_start\" ]; then exit 45; fi; "
+            "if ! kill -0 -- -\"$pid\" 2>/dev/null; then exit 47; fi; "
+            "kill -TERM -- -\"$pid\" 2>/dev/null || true; "
+            "i=0; while [ $i -lt 20 ] && kill -0 -- -\"$pid\" 2>/dev/null; do sleep 0.1; i=$((i+1)); done; "
+            "if kill -0 -- -\"$pid\" 2>/dev/null; then kill -KILL -- -\"$pid\" 2>/dev/null || true; fi; "
+            "i=0; while [ $i -lt 20 ] && kill -0 -- -\"$pid\" 2>/dev/null; do sleep 0.1; i=$((i+1)); done; "
+            "if kill -0 -- -\"$pid\" 2>/dev/null; then exit 46; fi; "
+            "printf 'cancelled\\n' > {cancelled}; printf 'CANCELLED\\n'"
+        ).format(
+            pid=shlex.quote(paths["pid"]),
+            start_ticks=shlex.quote(paths["start_ticks"]),
+            boot_id=shlex.quote(paths["boot_id"]),
+            cancelled=shlex.quote(paths["cancelled"]),
+        )
         r = self.backend.internal_exec(cmd, max(5.0, self.cfg.backend_timeout_s))
         if r.exit_code == 44:
-            return self.response(rid, "FAILED", None, "JOB_NOT_FOUND", "job metadata not found")
-        if r.exit_code != 0:
-            return self.response(rid, "OUTCOME_UNKNOWN", None, "CANCEL_UNCERTAIN", r.stderr[-500:])
+            return self.response(rid, "FAILED", None, "JOB_NOT_FOUND", "job identity metadata not found")
+        if r.exit_code == 45:
+            return self.response(
+                rid,
+                "OUTCOME_UNKNOWN",
+                {"job_id": job_id},
+                "JOB_IDENTITY_UNKNOWN",
+                "stored PID cannot be safely bound to the original job; refusing to signal it",
+            )
+        if r.exit_code == 47:
+            return self.response(
+                rid,
+                "OUTCOME_UNKNOWN",
+                {"job_id": job_id},
+                "JOB_STATE_UNKNOWN",
+                "job process is already absent without a terminal record",
+            )
+        if r.exit_code == 46:
+            return self.response(
+                rid,
+                "OUTCOME_UNKNOWN",
+                {"job_id": job_id},
+                "CANCEL_NOT_TERMINATED",
+                "process group still exists after TERM/KILL",
+            )
+        if r.exit_code != 0 or r.stdout.strip() != "CANCELLED":
+            return self.response(rid, "OUTCOME_UNKNOWN", {"job_id": job_id}, "CANCEL_UNCERTAIN", r.stderr[-500:])
         return self.response(rid, "VERIFIED", {"job_id": job_id, "state": "CANCELLED"})
 
     def rpc_transfer(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
