@@ -90,6 +90,15 @@ def is_side_effect_request(method: str, params: dict[str, Any]) -> bool:
     return method in SIDE_EFFECTS or (method == "transfer" and params.get("direction") == "upload")
 
 
+def correlate_response(response: dict[str, Any], session_id: str | None) -> dict[str, Any]:
+    correlated = dict(response)
+    if session_id is None:
+        correlated.pop("session_id", None)
+    else:
+        correlated["session_id"] = session_id
+    return correlated
+
+
 def canonical_request_fingerprint(server_id: str, method: str, params: dict[str, Any]) -> str:
     try:
         raw = json.dumps(
@@ -744,11 +753,9 @@ class RunnerService:
                     "LEDGER_UNAVAILABLE",
                     f"idempotency ledger unavailable before execution: {type(exc).__name__}",
                 )
-                if session_id is not None:
-                    unavailable["session_id"] = session_id
-                return unavailable
+                return correlate_response(unavailable, session_id)
             if prior and prior["response"] is not None:
-                return prior["response"]
+                return correlate_response(prior["response"], session_id)
             if prior and prior["state"] == "RUNNING":
                 running = self.response(
                     request_id,
@@ -756,9 +763,7 @@ class RunnerService:
                     code="REQUEST_ALREADY_IN_FLIGHT",
                     message="reconcile before retrying",
                 )
-                if session_id is not None:
-                    running["session_id"] = session_id
-                return running
+                return correlate_response(running, session_id)
         try:
             result = getattr(self, f"rpc_{method}")(request_id, params)
         except PolicyError as exc:
@@ -771,8 +776,6 @@ class RunnerService:
             result = self.response(request_id, "FAILED", code="BACKEND_FAILURE", message=str(exc))
         except Exception as exc:
             result = self.response(request_id, "FAILED", code=type(exc).__name__, message=str(exc))
-        if session_id is not None:
-            result["session_id"] = session_id
         if has_side_effect:
             try:
                 self.ledger.finish(request_id, result["status"], result)
@@ -787,10 +790,8 @@ class RunnerService:
                     "LEDGER_COMMIT_FAILED",
                     f"action returned but idempotency ledger terminal commit failed: {type(exc).__name__}",
                 )
-                if session_id is not None:
-                    uncertain["session_id"] = session_id
-                return uncertain
-        return result
+                return correlate_response(uncertain, session_id)
+        return correlate_response(result, session_id)
 
     def rpc_read_file(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         path = self.policy.path(p.get("path"))
