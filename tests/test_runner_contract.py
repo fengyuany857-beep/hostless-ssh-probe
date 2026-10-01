@@ -40,7 +40,7 @@ class ContractTests(unittest.TestCase):
         service.backend = SimpleNamespace(generation=3)
 
         class Ledger:
-            def begin(self, request_id, method, fingerprint):
+            def begin(self, request_id, method, fingerprint, reconcile_hint=None):
                 return None
             def finish(self, request_id, status, response):
                 raise RuntimeError("db unavailable")
