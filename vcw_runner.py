@@ -25,7 +25,7 @@ from channel_exec import CommandOutputTooLarge, CommandTimeout, run_command_chan
 
 RPC_VERSION = "vcw.runner.v1"
 STATUSES = {"VERIFIED", "FAILED", "OUTCOME_UNKNOWN", "DENIED", "RATE_LIMITED"}
-SIDE_EFFECTS = {"write_file", "apply_patch", "exec", "start_job", "cancel_job", "transfer"}
+SIDE_EFFECTS = {"write_file", "apply_patch", "exec", "start_job", "cancel_job"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 
 
@@ -84,6 +84,10 @@ def normalize_sha256_hex(value: object, field: str, *, allow_none: bool = False)
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
         raise PolicyError(f"{field} must be a SHA256 hex digest" + (" or null" if allow_none else ""))
     return value.lower()
+
+
+def is_side_effect_request(method: str, params: dict[str, Any]) -> bool:
+    return method in SIDE_EFFECTS or (method == "transfer" and params.get("direction") == "upload")
 
 
 def canonical_request_fingerprint(server_id: str, method: str, params: dict[str, Any]) -> str:
@@ -726,12 +730,35 @@ class RunnerService:
         method = self.policy.check_tool(body.get("method"))
         params = self.policy.params(method, body.get("params"))
         fingerprint = canonical_request_fingerprint(self.cfg.server_id, method, params)
-        if method in SIDE_EFFECTS:
-            prior = self.ledger.begin(request_id, method, fingerprint)
+        has_side_effect = is_side_effect_request(method, params)
+        if has_side_effect:
+            try:
+                prior = self.ledger.begin(request_id, method, fingerprint)
+            except PolicyError:
+                raise
+            except Exception as exc:
+                unavailable = self.response(
+                    request_id,
+                    "FAILED",
+                    None,
+                    "LEDGER_UNAVAILABLE",
+                    f"idempotency ledger unavailable before execution: {type(exc).__name__}",
+                )
+                if session_id is not None:
+                    unavailable["session_id"] = session_id
+                return unavailable
             if prior and prior["response"] is not None:
                 return prior["response"]
             if prior and prior["state"] == "RUNNING":
-                return self.response(request_id, "OUTCOME_UNKNOWN", code="REQUEST_ALREADY_IN_FLIGHT", message="reconcile before retrying")
+                running = self.response(
+                    request_id,
+                    "OUTCOME_UNKNOWN",
+                    code="REQUEST_ALREADY_IN_FLIGHT",
+                    message="reconcile before retrying",
+                )
+                if session_id is not None:
+                    running["session_id"] = session_id
+                return running
         try:
             result = getattr(self, f"rpc_{method}")(request_id, params)
         except PolicyError as exc:
@@ -746,7 +773,7 @@ class RunnerService:
             result = self.response(request_id, "FAILED", code=type(exc).__name__, message=str(exc))
         if session_id is not None:
             result["session_id"] = session_id
-        if method in SIDE_EFFECTS:
+        if has_side_effect:
             try:
                 self.ledger.finish(request_id, result["status"], result)
             except Exception as exc:
@@ -1076,7 +1103,16 @@ class RunnerService:
             target = p.get("target_request_id")
             if not isinstance(target, str):
                 raise PolicyError("target_request_id is required")
-            old = self.ledger.get(target)
+            try:
+                old = self.ledger.get(target)
+            except Exception as exc:
+                return self.response(
+                    rid,
+                    "FAILED",
+                    {"target_request_id": target},
+                    "LEDGER_UNAVAILABLE",
+                    f"idempotency ledger unavailable during reconciliation: {type(exc).__name__}",
+                )
             if not old:
                 return self.response(rid, "OUTCOME_UNKNOWN", None, "REQUEST_NOT_FOUND", "no local request record")
             if old["response"]:
