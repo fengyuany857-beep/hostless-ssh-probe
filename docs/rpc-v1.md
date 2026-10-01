@@ -1,10 +1,13 @@
 # VCW Remote Runner RPC v1
 
-The Runner is an execution boundary, not an agent.
+The Runner is a deterministic execution boundary, not an agent, Gateway, Execution Director, task planner, project selector, or authorization authority.
 
-It accepts deterministic actions from VCW V2 Gateway and returns deterministic state. It does not diagnose bugs, choose code designs, invent fixes, or change policy.
+Machine-readable schemas:
 
-## Transport
+- `docs/rpc-v1-request.schema.json`
+- `docs/rpc-v1-response.schema.json`
+
+## Transport and authentication
 
 `POST /v1/rpc`
 
@@ -12,25 +15,60 @@ Authentication:
 
 `Authorization: Bearer <RUNNER_TOKEN>`
 
-Envelope:
+The Runner-to-Gateway credential is distinct from the Runner-to-VPS SSH credential.
+
+## Request envelope
 
 ```json
 {
   "server_id": "prod-vps-1",
   "request_id": "gw-01J...",
-  "method": "read_file",
-  "params": {}
+  "session_id": "ses_xxx",
+  "method": "write_file",
+  "params": {
+    "path": "src/a.py",
+    "content": "...",
+    "expected_sha256": "..."
+  }
 }
 ```
 
-`server_id` is fixed by deployment configuration. Arbitrary hosts are never accepted in RPC input.
+Required envelope fields are `server_id`, `request_id`, `method`, and `params`. `session_id` is optional.
 
-Response:
+Unknown envelope fields are denied. In particular, RPC input cannot select or override `host`, `ip`, `port`, `username`, `ssh_private_key`, or project root.
+
+`session_id` is opaque correlation metadata only. Runner validates its syntax and may echo/audit it, but does not authorize it, enforce Gateway lease/TTL, acquire project locks, or infer permission from it.
+
+## Request identity and idempotency
+
+For side-effect methods, `request_id` is bound to a canonical request fingerprint over:
+
+- fixed `server_id`
+- method
+- method params
+
+`session_id` is deliberately excluded from the action fingerprint so the same uncertain action can be reconciled/replayed across a Gateway session renewal without changing its semantic identity.
+
+Reusing a `request_id` with another method or different params is `DENIED`. A terminal cached response is replayed without repeating the side effect. Legacy ledger rows that predate fingerprints are reconcile-only and cannot be blindly replayed.
+
+Side-effect methods are:
+
+- `write_file`
+- `apply_patch`
+- `exec`
+- `start_job`
+- `cancel_job`
+- upload `transfer`
+
+The implementation currently also records download `transfer` through the side-effect ledger because `transfer` is one RPC method; callers must still use unique request IDs.
+
+## Response envelope
 
 ```json
 {
   "rpc_version": "vcw.runner.v1",
   "request_id": "gw-01J...",
+  "session_id": "ses_xxx",
   "server_id": "prod-vps-1",
   "connection_generation": 4,
   "status": "VERIFIED",
@@ -39,76 +77,301 @@ Response:
 }
 ```
 
-Terminal Runner statuses:
+`session_id` is present only when supplied and validated.
 
-- `VERIFIED`
-- `FAILED`
-- `OUTCOME_UNKNOWN`
-- `DENIED`
-- `RATE_LIMITED`
+Runner statuses:
 
-Runner-generated rate limiting uses HTTP 429, `Retry-After`, and `error.code=RUNNER_INFLIGHT_LIMIT` so it can be distinguished from upstream ChatGPT/Tunnel throttling.
+- `VERIFIED`: the method-specific post-condition was observed.
+- `FAILED`: the Runner has evidence that the requested action did not reach the required success condition.
+- `OUTCOME_UNKNOWN`: a consequential outcome cannot be safely classified and must be reconciled before retry.
+- `DENIED`: request violates Runner policy or contract.
+- `RATE_LIMITED`: local Runner concurrency limit rejected the request before execution.
+
+Runner-generated saturation uses HTTP 429, `Retry-After`, and `error.code=RUNNER_INFLIGHT_LIMIT`.
 
 ## Methods
 
-- `read_file(path, encoding?)`
-- `write_file(path, content, encoding?, expected_sha256?)`
-- `apply_patch(patch)`
-- `exec(argv, cwd?, timeout_s?)`
-- `start_job(argv, cwd?)`
-- `job_status(job_id, max_log_bytes?)`
-- `cancel_job(job_id)`
-- `transfer(direction, ...)`
-- `reconcile(kind, ...)`
+### read_file
 
-### Writes and CAS
+Request params:
 
-`write_file` and upload transfer stage data through SFTP temporary files, use OpenSSH `posix_rename`, read the result back, and verify SHA256. `expected_sha256` provides compare-and-swap semantics. A mismatch is `FAILED/CAS_MISMATCH`.
+```json
+{"path":"src/a.py","encoding":"utf-8"}
+```
 
-### Patch
+`encoding` is optional: `utf-8` or `base64`.
 
-Patch paths are pre-screened for root escape. The Runner stages the patch under `.vcw-runner/tmp`, runs `git apply --check`, then applies it. It does not invent a repair when a patch fails.
+VERIFIED result:
 
-### Exec
+```json
+{
+  "path": "/fixed/project/src/a.py",
+  "encoding": "utf-8",
+  "content": "...",
+  "sha256": "64-hex",
+  "bytes": 123
+}
+```
 
-Caller input is argv, not a shell string. `argv[0]` must be in `VCW_ALLOWED_EXEC`. The default list excludes `sh` and `bash`.
+### write_file
 
-This is not a filesystem sandbox. The target SSH account must itself be least-privileged and unable to access host secrets outside the intended project.
+Request params:
 
-### Jobs
+```json
+{
+  "path": "src/a.py",
+  "content": "...",
+  "encoding": "utf-8",
+  "expected_sha256": "64-hex"
+}
+```
 
-`start_job` creates metadata under `.vcw-runner/jobs/<job_id>`, starts a detached process group and returns a deterministic job id derived from `request_id`.
+`expected_sha256` is optional. When supplied it is a compare-and-swap precondition.
 
-`job_status` reports `RUNNING`, `SUCCEEDED`, `FAILED`, or `OUTCOME_UNKNOWN` if a process disappears without an exit record.
+Success path:
 
-### Reconciliation
+1. lexical project-root check;
+2. canonical parent confinement;
+3. existing leaf symlink refusal;
+4. bounded current-file read and SHA256;
+5. CAS comparison;
+6. SFTP temporary write and close/flush;
+7. atomic OpenSSH `posix_rename`;
+8. target readback;
+9. final SHA256 equality check.
 
-Supported v1 forms:
+VERIFIED result includes:
 
-- `kind=request` + `target_request_id`
-- `kind=file` + `path` + `sha256`
-- `kind=job` + `job_id`
+```json
+{
+  "path": "/fixed/project/src/a.py",
+  "ok": true,
+  "sha256": "new-64-hex",
+  "previous_sha256": "old-64-hex-or-null",
+  "bytes": 123
+}
+```
+
+A stale precondition is `FAILED/CAS_MISMATCH` and does not rename the target.
+
+If rename has begun but the rename/readback/final-digest outcome cannot be proven, the request is `OUTCOME_UNKNOWN/BACKEND_OUTCOME_UNKNOWN`; reconcile the target file before retrying.
+
+Current v1 durability claim is atomic replacement plus successful remote readback. It does not claim power-loss durability equivalent to a proven remote file+directory fsync sequence.
+
+### apply_patch
+
+Request params:
+
+```json
+{"patch":"unified diff text"}
+```
+
+Runner:
+
+1. pre-screens every diff path for project-root escape;
+2. stages the patch under Runner internal project metadata;
+3. runs `git apply --check`;
+4. runs `git apply --whitespace=nowarn`;
+5. verifies the applied post-condition with `git apply --reverse --check`;
+6. best-effort removes the temporary patch.
+
+A pre-check failure is `FAILED/PATCH_CHECK_FAILED`. A successful apply whose post-condition cannot be verified is `OUTCOME_UNKNOWN/PATCH_POSTCONDITION_UNVERIFIED`.
+
+VERIFIED result:
+
+```json
+{
+  "touched": ["src/a.py"],
+  "patch_sha256": "64-hex",
+  "postcondition": "reverse_apply_check"
+}
+```
+
+Runner never invents a repair when a patch fails.
+
+### exec
+
+Request params:
+
+```json
+{
+  "argv": ["pytest", "-q"],
+  "cwd": ".",
+  "timeout_s": 30
+}
+```
+
+Caller input is argv, never an arbitrary shell command string. `argv[0]` must be a bare executable name and must be in `VCW_ALLOWED_EXEC`; an absolute/relative executable path such as `/tmp/fake/git` is denied even if its basename is allowlisted.
+
+Executable resolution uses deployment-fixed `VCW_EXEC_PATH`. `cwd` is resolved canonically and must remain inside the configured project root. `timeout_s` must be finite and positive and is capped at 300 seconds.
+
+Result:
+
+```json
+{
+  "argv": ["pytest", "-q"],
+  "cwd": "/fixed/project",
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": "..."
+}
+```
+
+Exit code 0 maps to `VERIFIED`. A non-zero exit maps to `FAILED/NONZERO_EXIT`. A backend deadline maps to `OUTCOME_UNKNOWN/BACKEND_TIMEOUT` and resets the SSH connection.
+
+Runner never infers test success from stdout text.
+
+The executable allowlist is not a host filesystem sandbox. Target-account OS permissions remain part of the security boundary.
+
+### start_job
+
+Request params:
+
+```json
+{"argv":["python3","worker.py"],"cwd":"."}
+```
+
+The deterministic `job_id` derives from `request_id`. Runner records:
+
+- PID
+- Linux process start ticks from `/proc/<pid>/stat`
+- boot ID
+- exit record
+- log
+- cancellation marker
+
+PID alone is never treated as sufficient process identity.
+
+A VERIFIED start result includes:
+
+```json
+{
+  "job_id": "job_...",
+  "pid": 1234,
+  "state": "RUNNING",
+  "argv": ["python3","worker.py"],
+  "cwd": "/fixed/project"
+}
+```
+
+A very short job may already be observed in another terminal job state.
+
+### job_status
+
+Request params:
+
+```json
+{"job_id":"job_...","max_log_bytes":32768}
+```
+
+Method result state is one of:
+
+- `RUNNING`
+- `SUCCEEDED`
+- `FAILED`
+- `CANCELLED`
+- `UNKNOWN`
+
+If PID/boot/start identity cannot be safely tied to the original job, Runner returns `OUTCOME_UNKNOWN/JOB_IDENTITY_UNKNOWN`. If a process disappeared without a terminal record it returns `OUTCOME_UNKNOWN/JOB_STATE_UNKNOWN`.
+
+### cancel_job
+
+Request params:
+
+```json
+{"job_id":"job_..."}
+```
+
+Runner verifies PID + boot ID + process start ticks before signaling the process group. It refuses to kill a process whose identity no longer matches the recorded job.
+
+A VERIFIED cancellation means the process group was no longer observed after TERM/KILL and the cancellation marker was written.
+
+### transfer
+
+Upload:
+
+```json
+{
+  "direction":"upload",
+  "path":"artifact.bin",
+  "encoding":"base64",
+  "content":"...",
+  "content_sha256":"64-hex",
+  "expected_sha256":"64-hex"
+}
+```
+
+`content_sha256` and `expected_sha256` are optional. Upload uses the same CAS, atomic rename, readback and uncertainty semantics as `write_file`.
+
+Download:
+
+```json
+{"direction":"download","path":"artifact.bin"}
+```
+
+VERIFIED download returns base64 content, SHA256 and byte count.
+
+### reconcile
+
+Request form for an idempotency record:
+
+```json
+{"kind":"request","target_request_id":"gw-01J..."}
+```
+
+A stored terminal non-unknown result is reported as observed. A stored `OUTCOME_UNKNOWN` remains `OUTCOME_UNKNOWN`; reconciliation never upgrades it merely because a ledger row exists.
+
+File post-condition:
+
+```json
+{"kind":"file","path":"src/a.py","sha256":"64-hex"}
+```
+
+Job observation:
+
+```json
+{"kind":"job","job_id":"job_...","max_log_bytes":32768}
+```
 
 Unknown side effects are never blindly retried.
 
-## Policy boundary
+## Ledger failure semantics
 
-Runner enforces:
+The idempotency ledger is intentionally not the VCW task/session state machine.
 
-- fixed `VCW_SERVER_ID`
-- fixed `TARGET_HOST` / `TARGET_PORT` / `TARGET_USER`
+If an action returns from the backend but the terminal ledger commit fails, Runner returns:
+
+- `status=OUTCOME_UNKNOWN`
+- `error.code=LEDGER_COMMIT_FAILED`
+- the backend-observed action status/result as evidence
+
+The caller must reconcile before any retry.
+
+Production Hostless deployments use `VCW_LEDGER_DATABASE_URL` for durable PostgreSQL idempotency state. SQLite via `VCW_LEDGER_DB` is local/dev fallback only.
+
+## Fixed execution identity
+
+Deployment fixes:
+
+- `VCW_SERVER_ID`
+- `TARGET_HOST`
+- `TARGET_PORT`
+- `TARGET_USER`
+- SSH private credential
 - pinned SSH host-key SHA256
-- one configured project root
-- RPC tool allowlist
-- executable allowlist
-- path root checks plus SFTP canonical-path checks
-- symlink overwrite refusal
-- CAS and post-write digest verification
-- bounded file/output sizes
-- bounded Runner concurrency
-- backend timeouts and connection generation
-- structured audit events without file contents or credentials
+- `VCW_PROJECT_ROOT`
+- `VCW_ALLOWED_TOOLS`
+- `VCW_ALLOWED_EXEC`
+- `VCW_EXEC_PATH`
 
-VCW V2 Gateway remains responsible for authorization, 25-minute session lease, project binding, queue/lock policy, and whether a deterministic Runner call is permitted.
+Caller input cannot alter these connection facts.
 
-Execution Director/GPT remains responsible for diagnosis and semantic decisions.
+`GET /v1/info` exposes a runtime build SHA256 fingerprint over the packaged Runner source/requirements and may expose `VCW_RUNNER_BUILD_REVISION` when the deployment supplies it. This is provenance only, not authorization.
+
+## Authority boundary
+
+VCW V2 Gateway owns authorization, approval, session validity/TTL, project binding, queue/lock policy and Runner routing.
+
+Execution Director/GPT owns task decomposition, diagnosis, semantic decisions, retry/backoff policy and next-step choice.
+
+Runner owns deterministic action validation, execution evidence, post-condition verification, idempotency and reconciliation only.
