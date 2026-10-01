@@ -14,7 +14,7 @@ The deployed build must be bound by the authenticated `/v1/info.build.fingerprin
 - optional `session_id` is syntax-checked correlation only and does not create authorization.
 - correct pinned SSH host key connects.
 - deliberately wrong SSH host-key fingerprint is rejected before authentication and is never auto-accepted.
-- reconnect increments `connection_generation`.
+- `connection_generation` increments exactly once per successfully established SSH connection epoch; reset alone does not increment it.
 
 ## Path and executable policy
 
@@ -23,6 +23,8 @@ The deployed build must be bound by the authenticated `/v1/info.build.fingerprin
 - absolute path outside the root is denied.
 - symlink resolving outside the root is denied.
 - overwrite of an existing symlink is denied.
+- caller file APIs deny `.git` and `.vcw-runner` control metadata.
+- overwrite of non-regular files is denied.
 - executable outside `VCW_ALLOWED_EXEC` is denied.
 - caller executable path such as `/tmp/fake/git` is denied even when basename is allowlisted.
 - executable resolution uses deployment-fixed `VCW_EXEC_PATH`.
@@ -49,6 +51,8 @@ The target SSH account must be manually verified as least-privileged. Runner arg
 - `write_file` with correct expected SHA succeeds.
 - stale expected SHA returns `FAILED/CAS_MISMATCH` and leaves the file unchanged.
 - successful write is read back and digest-verified.
+- existing executable/file mode is preserved across atomic replacement.
+- a newly created file has mode `0644`.
 - upload/download `transfer` round-trip has identical SHA256.
 - malformed or mixed-case SHA preconditions have deterministic normalization/rejection.
 - oversized input is rejected.
@@ -77,6 +81,8 @@ Current v1 durability claim is atomic replacement plus successful remote readbac
 - repeated start with same request id does not create a second job.
 - job identity records PID + boot ID + process start ticks.
 - `job_status` observes RUNNING then SUCCEEDED/FAILED/CANCELLED as applicable.
+- cancel on an already SUCCEEDED/FAILED job returns `FAILED/JOB_ALREADY_TERMINAL` and sends no signal.
+- cancel on an already CANCELLED job is idempotently VERIFIED without re-signaling.
 - PID identity mismatch is `OUTCOME_UNKNOWN/JOB_IDENTITY_UNKNOWN`.
 - `cancel_job` refuses to signal a PID that cannot be proven to be the original job.
 - VERIFIED cancel requires the process group to be observed gone before the cancellation marker is committed.
@@ -88,6 +94,9 @@ Current v1 durability claim is atomic replacement plus successful remote readbac
 - `reconcile(kind=job)` returns observed durable job state without inventing task state.
 - `reconcile(kind=request)` does not turn stored `OUTCOME_UNKNOWN` into false `VERIFIED`.
 - a RUNNING/incomplete ledger record remains uncertain until method-specific evidence resolves it.
+- an existing claim without terminal response is never re-executed, regardless of stored non-terminal/corrupt state.
+- write/upload unknowns expose file path + desired SHA reconciliation hints without storing file content.
+- start/cancel job unknowns expose deterministic job reconciliation hints.
 
 ## Durable idempotency ledger
 
@@ -113,7 +122,8 @@ Use `tools/ledger_persistence_acceptance.py prepare` and `verify` for this gate.
 - response includes `Retry-After`.
 - status is `RATE_LIMITED`.
 - error code is `RUNNER_INFLIGHT_LIMIT`, distinguishable from upstream proxy/tunnel throttling.
-- audit contains request id, method, status, duration and connection generation for completed RPCs.
+- audit contains validated request id/method, status, duration and connection generation for completed RPCs.
+- invalid correlation values are not copied verbatim into rate-limit or audit events.
 - correlation session id may be present only as validated opaque metadata.
 - audit does not contain bearer token, SSH private key/base64 key, request file contents or response file contents.
 
@@ -122,6 +132,8 @@ Use `tools/ledger_persistence_acceptance.py prepare` and `verify` for this gate.
 Verify on the actual VPS:
 
 - dedicated `vcwrunner` account exists;
+- Runner configuration rejects `TARGET_USER=root`;
+- Runner configuration rejects filesystem-root project root;
 - no root login is used by Runner;
 - account is not in docker/admin-equivalent groups;
 - no broad sudo permission;
