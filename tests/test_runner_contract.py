@@ -1,4 +1,5 @@
 import math
+import stat
 import unittest
 import vcw_runner as vr
 from types import SimpleNamespace
@@ -118,6 +119,8 @@ class ContractTests(unittest.TestCase):
                 raise FileNotFoundError(path)
             def open(self, path, mode):
                 return RemoteFile()
+            def chmod(self, path, mode):
+                pass
             def posix_rename(self, src, dst):
                 raise OSError("connection lost during rename")
             def remove(self, path):
@@ -323,6 +326,77 @@ class ContractTests(unittest.TestCase):
         finally:
             vr.paramiko.SSHClient = old_client
             vr.load_private_key = old_loader
+
+    def test_atomic_write_preserves_existing_mode(self):
+        policy = Policy("/srv/project", frozenset({"write_file"}), frozenset())
+        cfg = SimpleNamespace(max_file_bytes=1024)
+
+        class Attr:
+            def __init__(self, mode, size):
+                self.st_mode = mode
+                self.st_size = size
+
+        class RemoteFile:
+            def __init__(self, fs, path, mode):
+                self.fs = fs
+                self.path = path
+                self.mode = mode
+                self.buf = bytearray(fs.get(path, {}).get("data", b""))
+                if mode == "wb":
+                    self.buf = bytearray()
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                if self.mode == "wb":
+                    self.fs.setdefault(self.path, {})["data"] = bytes(self.buf)
+                return False
+            def write(self, data):
+                self.buf.extend(data)
+            def read(self, n=-1):
+                data = bytes(self.buf)
+                return data if n < 0 else data[:n]
+            def flush(self):
+                pass
+
+        class Sftp:
+            def __init__(self):
+                self.fs = {
+                    "/srv/project/tool.sh": {"data": b"old\n", "mode": 0o755}
+                }
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def normalize(self, path):
+                return path
+            def lstat(self, path):
+                if path not in self.fs:
+                    raise FileNotFoundError(path)
+                entry = self.fs[path]
+                return Attr(stat.S_IFREG | entry["mode"], len(entry["data"]))
+            def open(self, path, mode):
+                return RemoteFile(self.fs, path, mode)
+            def chmod(self, path, mode):
+                self.fs.setdefault(path, {"data": b""})["mode"] = mode
+            def posix_rename(self, src, dst):
+                self.fs[dst] = self.fs.pop(src)
+            def remove(self, path):
+                self.fs.pop(path, None)
+
+        class Client:
+            def __init__(self, sftp):
+                self.sftp = sftp
+            def open_sftp(self):
+                return self.sftp
+
+        sftp = Sftp()
+        backend = SSHBackend(cfg, policy)
+        backend.connect = lambda: Client(sftp)
+        result = backend.write_bytes_cas("/srv/project/tool.sh", b"new\n", None)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "0755")
+        self.assertEqual(sftp.fs["/srv/project/tool.sh"]["mode"], 0o755)
+        self.assertEqual(sftp.fs["/srv/project/tool.sh"]["data"], b"new\n")
 
 
 if __name__ == "__main__":
