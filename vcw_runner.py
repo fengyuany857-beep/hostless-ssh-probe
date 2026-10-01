@@ -25,6 +25,7 @@ from channel_exec import CommandOutputTooLarge, CommandTimeout, run_command_chan
 
 RPC_VERSION = "vcw.runner.v1"
 STATUSES = {"VERIFIED", "FAILED", "OUTCOME_UNKNOWN", "DENIED", "RATE_LIMITED"}
+KNOWN_METHODS = frozenset({"read_file", "write_file", "apply_patch", "exec", "start_job", "job_status", "cancel_job", "transfer", "reconcile"})
 SIDE_EFFECTS = {"write_file", "apply_patch", "exec", "start_job", "cancel_job"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
 
@@ -152,8 +153,11 @@ class Config:
         if not key.strip():
             raise RuntimeError("SSH_PRIVATE_KEY or SSH_PRIVATE_KEY_B64 is required")
         root = _required("VCW_PROJECT_ROOT")
-        if not root.startswith("/"):
-            raise RuntimeError("VCW_PROJECT_ROOT must be absolute")
+        if not root.startswith("/") or posixpath.normpath(root) != root or root == "/":
+            raise RuntimeError("VCW_PROJECT_ROOT must be a normalized absolute non-root path")
+        target_user = _required("TARGET_USER")
+        if target_user == "root":
+            raise RuntimeError("TARGET_USER=root is forbidden; use a dedicated least-privileged account")
         token = os.environ.get("RUNNER_TOKEN", "").strip()
         if not token:
             raise RuntimeError("RUNNER_TOKEN is required")
@@ -167,13 +171,13 @@ class Config:
         max_output_bytes = int(os.environ.get("VCW_MAX_OUTPUT_BYTES", str(1024 * 1024)))
         if max_file_bytes <= 0 or max_output_bytes <= 0:
             raise RuntimeError("VCW_MAX_FILE_BYTES and VCW_MAX_OUTPUT_BYTES must be positive")
-        return cls(
+        cfg = cls(
             runner_token=token,
             server_id=_required("VCW_SERVER_ID"),
             target_host=_required("TARGET_HOST"),
             target_port=target_port,
-            target_user=_required("TARGET_USER"),
-            project_root=root.rstrip("/") or "/",
+            target_user=target_user,
+            project_root=root,
             ssh_private_key=key,
             ssh_host_key_sha256=normalize_host_key_sha256(_required("SSH_HOST_KEY_SHA256")),
             allowed_tools=_csv("VCW_ALLOWED_TOOLS", "read_file,write_file,apply_patch,exec,start_job,job_status,cancel_job,transfer,reconcile"),
@@ -186,6 +190,12 @@ class Config:
             ledger_db=os.environ.get("VCW_LEDGER_DATABASE_URL", "").strip() or os.environ.get("VCW_LEDGER_DB", "/tmp/vcw-runner-ledger.sqlite3"),
             port=port,
         )
+        if not cfg.allowed_tools or not cfg.allowed_tools.issubset(KNOWN_METHODS):
+            unknown = sorted(cfg.allowed_tools - KNOWN_METHODS)
+            raise RuntimeError(f"VCW_ALLOWED_TOOLS contains unsupported v1 methods: {','.join(unknown)}")
+        if not cfg.allowed_exec or any(posixpath.basename(x) != x or not x for x in cfg.allowed_exec):
+            raise RuntimeError("VCW_ALLOWED_EXEC must contain bare executable names only")
+        return cfg
 
 
 @dataclass(frozen=True)
@@ -702,7 +712,8 @@ class SSHBackend:
                 self.reset()
                 raise BackendTimeout(str(exc)) from exc
             except CommandOutputTooLarge as exc:
-                raise BackendFailure(str(exc)) from exc
+                self.reset()
+                raise BackendUncertain(f"{exc}; remote command outcome is unknown") from exc
 
     def exec_argv(self, argv: list[str], cwd: str | None, timeout_s: float | None = None) -> ExecResult:
         argv = self.policy.argv(argv)
