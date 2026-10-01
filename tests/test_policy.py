@@ -1,6 +1,8 @@
+import stat
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 
 fake = types.ModuleType('paramiko')
 class MissingHostKeyPolicy: pass
