@@ -662,10 +662,8 @@ class RunnerService:
     def rpc_write_file(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         path = self.policy.path(p.get("path"))
         data = self.decode_content(p)
-        expected = p.get("expected_sha256")
-        if expected is not None and (not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected)):
-            raise PolicyError("expected_sha256 must be a SHA256 hex digest or null")
-        result = self.backend.write_bytes_cas(path, data, expected.lower() if isinstance(expected, str) else None)
+        expected = normalize_sha256_hex(p.get("expected_sha256"), "expected_sha256", allow_none=True)
+        result = self.backend.write_bytes_cas(path, data, expected)
         if not result["ok"]:
             return self.response(rid, "FAILED", result, result["code"], "CAS precondition failed")
         return self.response(rid, "VERIFIED", {"path": path, **result})
@@ -925,11 +923,12 @@ class RunnerService:
         direction = p.get("direction")
         if direction == "upload":
             data = self.decode_content(p)
-            content_sha = p.get("content_sha256")
+            content_sha = normalize_sha256_hex(p.get("content_sha256"), "content_sha256", allow_none=True)
             if content_sha is not None and sha256(data) != content_sha:
                 raise PolicyError("content_sha256 does not match upload payload")
+            expected = normalize_sha256_hex(p.get("expected_sha256"), "expected_sha256", allow_none=True)
             path = self.policy.path(p.get("path"))
-            result = self.backend.write_bytes_cas(path, data, p.get("expected_sha256"))
+            result = self.backend.write_bytes_cas(path, data, expected)
             if not result["ok"]:
                 return self.response(rid, "FAILED", result, result["code"], "transfer CAS failed")
             return self.response(rid, "VERIFIED", {"direction": direction, "path": path, **result})
