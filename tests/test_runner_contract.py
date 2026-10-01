@@ -56,7 +56,7 @@ class ContractTests(unittest.TestCase):
 
     def test_job_status_preserves_cancelled_terminal_state(self):
         service = RunnerService.__new__(RunnerService)
-        service.cfg = SimpleNamespace(project_root="/srv/project")
+        service.cfg = SimpleNamespace(project_root="/srv/project", server_id="srv")
         service.policy = Policy("/srv/project", frozenset(), frozenset())
 
         class Backend:
@@ -72,7 +72,7 @@ class ContractTests(unittest.TestCase):
 
     def test_cancel_refuses_unknown_process_identity(self):
         service = RunnerService.__new__(RunnerService)
-        service.cfg = SimpleNamespace(project_root="/srv/project", backend_timeout_s=5)
+        service.cfg = SimpleNamespace(project_root="/srv/project", backend_timeout_s=5, server_id="srv")
         service.policy = Policy("/srv/project", frozenset(), frozenset())
 
         class Backend:
