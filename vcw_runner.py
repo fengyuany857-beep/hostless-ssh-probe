@@ -169,8 +169,11 @@ class Config:
             raise RuntimeError("PORT must be between 1 and 65535")
         max_file_bytes = int(os.environ.get("VCW_MAX_FILE_BYTES", str(4 * 1024 * 1024)))
         max_output_bytes = int(os.environ.get("VCW_MAX_OUTPUT_BYTES", str(1024 * 1024)))
+        max_inflight = int(os.environ.get("VCW_MAX_INFLIGHT", "4"))
         if max_file_bytes <= 0 or max_output_bytes <= 0:
             raise RuntimeError("VCW_MAX_FILE_BYTES and VCW_MAX_OUTPUT_BYTES must be positive")
+        if not 1 <= max_inflight <= 128:
+            raise RuntimeError("VCW_MAX_INFLIGHT must be between 1 and 128")
         cfg = cls(
             runner_token=token,
             server_id=_required("VCW_SERVER_ID"),
@@ -186,7 +189,7 @@ class Config:
             backend_timeout_s=_positive_finite_env("VCW_BACKEND_TIMEOUT_S", "20", maximum=300.0),
             max_file_bytes=max_file_bytes,
             max_output_bytes=max_output_bytes,
-            max_inflight=max(1, int(os.environ.get("VCW_MAX_INFLIGHT", "4"))),
+            max_inflight=max_inflight,
             ledger_db=os.environ.get("VCW_LEDGER_DATABASE_URL", "").strip() or os.environ.get("VCW_LEDGER_DB", "/tmp/vcw-runner-ledger.sqlite3"),
             port=port,
         )
@@ -977,11 +980,12 @@ class RunnerService:
     def rpc_job_status(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         job_id = p.get("job_id")
         paths = self.job_paths(job_id)
-        try:
-            max_log = int(p.get("max_log_bytes", 32768))
-        except (TypeError, ValueError) as exc:
-            raise PolicyError("max_log_bytes must be an integer") from exc
-        max_log = min(max(max_log, 0), 131072)
+        raw_max_log = p.get("max_log_bytes", 32768)
+        if isinstance(raw_max_log, bool) or not isinstance(raw_max_log, int):
+            raise PolicyError("max_log_bytes must be an integer")
+        if not 0 <= raw_max_log <= 131072:
+            raise PolicyError("max_log_bytes must be between 0 and 131072")
+        max_log = raw_max_log
 
         cmd = (
             "if [ -f {exitf} ]; then printf 'EXIT '; cat {exitf}; "
@@ -1120,9 +1124,7 @@ class RunnerService:
     def rpc_reconcile(self, rid: str, p: dict[str, Any]) -> dict[str, Any]:
         kind = p.get("kind")
         if kind == "request":
-            target = p.get("target_request_id")
-            if not isinstance(target, str):
-                raise PolicyError("target_request_id is required")
+            target = self.policy.check_request_id(p.get("target_request_id"))
             try:
                 old = self.ledger.get(target)
             except Exception as exc:
