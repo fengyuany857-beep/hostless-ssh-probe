@@ -38,4 +38,4 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests -v
         timeout-minutes: 2
-      - run: python -m py_compile app.py vcw_runner.py channel_exec.py
+      - run: python -m py_compile app.py vcw_runner.py channel_exec.py tools/ledger_persistence_acceptance.py
