@@ -113,7 +113,7 @@ class Config:
             max_file_bytes=int(os.environ.get("VCW_MAX_FILE_BYTES", str(4 * 1024 * 1024))),
             max_output_bytes=int(os.environ.get("VCW_MAX_OUTPUT_BYTES", str(1024 * 1024))),
             max_inflight=max(1, int(os.environ.get("VCW_MAX_INFLIGHT", "4"))),
-            state_db=os.environ.get("VCW_STATE_DB", "/tmp/vcw-runner.sqlite3"),
+            state_db=os.environ.get("VCW_STATE_DATABASE_URL", "").strip() or os.environ.get("VCW_STATE_DB", "/tmp/vcw-runner.sqlite3"),
             port=int(os.environ.get("PORT", "8080")),
         )
 
@@ -178,50 +178,153 @@ class Policy:
 
 
 class OperationStore:
-    def __init__(self, path: str):
-        self.path = path
-        self.lock = threading.Lock()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            conn.execute("CREATE TABLE IF NOT EXISTS operations (request_id TEXT PRIMARY KEY, method TEXT NOT NULL, state TEXT NOT NULL, response_json TEXT, updated_at REAL NOT NULL)")
+    POSTGRES_PREFIXES = ("postgresql://", "postgres://")
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=5)
+    def __init__(self, target: str):
+        self.target = target
+        self.lock = threading.Lock()
+        self.backend = "postgresql" if target.startswith(self.POSTGRES_PREFIXES) else "sqlite"
+        self.durable = self.backend == "postgresql"
+        self._psycopg = None
+
+        if self.backend == "postgresql":
+            try:
+                import psycopg
+            except ImportError as exc:
+                raise RuntimeError("psycopg is required for VCW_STATE_DATABASE_URL") from exc
+            self._psycopg = psycopg
+            with self._pg_connect() as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS operations ("
+                    "request_id TEXT PRIMARY KEY,"
+                    "method TEXT NOT NULL,"
+                    "state TEXT NOT NULL,"
+                    "response_json TEXT,"
+                    "updated_at DOUBLE PRECISION NOT NULL"
+                    ")"
+                )
+        else:
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            with self._sqlite_connect() as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS operations ("
+                    "request_id TEXT PRIMARY KEY,"
+                    "method TEXT NOT NULL,"
+                    "state TEXT NOT NULL,"
+                    "response_json TEXT,"
+                    "updated_at REAL NOT NULL"
+                    ")"
+                )
+
+    def _sqlite_connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.target, timeout=5)
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
-    def get(self, request_id: str) -> dict[str, Any] | None:
-        with self.lock, self._connect() as conn:
-            row = conn.execute("SELECT method,state,response_json,updated_at FROM operations WHERE request_id=?", (request_id,)).fetchone()
+    def _pg_connect(self):
+        assert self._psycopg is not None
+        return self._psycopg.connect(
+            self.target,
+            connect_timeout=5,
+            prepare_threshold=None,
+        )
+
+    @staticmethod
+    def _record(row) -> dict[str, Any] | None:
         if not row:
             return None
-        return {"method": row[0], "state": row[1], "response": json.loads(row[2]) if row[2] else None, "updated_at": row[3]}
+        return {
+            "method": row[0],
+            "state": row[1],
+            "response": json.loads(row[2]) if row[2] else None,
+            "updated_at": row[3],
+        }
+
+    def get(self, request_id: str) -> dict[str, Any] | None:
+        if self.backend == "postgresql":
+            with self._pg_connect() as conn:
+                row = conn.execute(
+                    "SELECT method,state,response_json,updated_at "
+                    "FROM operations WHERE request_id=%s",
+                    (request_id,),
+                ).fetchone()
+            return self._record(row)
+
+        with self.lock, self._sqlite_connect() as conn:
+            row = conn.execute(
+                "SELECT method,state,response_json,updated_at "
+                "FROM operations WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+        return self._record(row)
 
     def begin(self, request_id: str, method: str) -> dict[str, Any] | None:
-        with self.lock, self._connect() as conn:
+        now = time.time()
+
+        if self.backend == "postgresql":
+            with self._pg_connect() as conn:
+                inserted = conn.execute(
+                    "INSERT INTO operations(request_id,method,state,updated_at) "
+                    "VALUES(%s,%s,'RUNNING',%s) "
+                    "ON CONFLICT (request_id) DO NOTHING "
+                    "RETURNING request_id",
+                    (request_id, method, now),
+                ).fetchone()
+                if inserted:
+                    return None
+
+                row = conn.execute(
+                    "SELECT method,state,response_json,updated_at "
+                    "FROM operations WHERE request_id=%s FOR UPDATE",
+                    (request_id,),
+                ).fetchone()
+                if not row:
+                    raise RuntimeError("operation ledger conflict without visible row")
+                record = self._record(row)
+                assert record is not None
+                if record["method"] != method:
+                    raise PolicyError("request_id already used for another method")
+                return record
+
+        with self.lock, self._sqlite_connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT method,state,response_json,updated_at FROM operations WHERE request_id=?",
+                "SELECT method,state,response_json,updated_at "
+                "FROM operations WHERE request_id=?",
                 (request_id,),
             ).fetchone()
             if row:
-                if row[0] != method:
+                record = self._record(row)
+                assert record is not None
+                if record["method"] != method:
                     raise PolicyError("request_id already used for another method")
-                return {
-                    "method": row[0],
-                    "state": row[1],
-                    "response": json.loads(row[2]) if row[2] else None,
-                    "updated_at": row[3],
-                }
+                return record
             conn.execute(
-                "INSERT INTO operations(request_id,method,state,updated_at) VALUES(?,?,'RUNNING',?)",
-                (request_id, method, time.time()),
+                "INSERT INTO operations(request_id,method,state,updated_at) "
+                "VALUES(?,?,'RUNNING',?)",
+                (request_id, method, now),
             )
         return None
 
     def finish(self, request_id: str, status: str, response: dict[str, Any]) -> None:
-        with self.lock, self._connect() as conn:
-            conn.execute("UPDATE operations SET state=?, response_json=?, updated_at=? WHERE request_id=?", (status, json.dumps(response, separators=(",", ":"), sort_keys=True), time.time(), request_id))
+        payload = json.dumps(response, separators=(",", ":"), sort_keys=True)
+        now = time.time()
+
+        if self.backend == "postgresql":
+            with self._pg_connect() as conn:
+                conn.execute(
+                    "UPDATE operations SET state=%s,response_json=%s,updated_at=%s "
+                    "WHERE request_id=%s",
+                    (status, payload, now, request_id),
+                )
+            return
+
+        with self.lock, self._sqlite_connect() as conn:
+            conn.execute(
+                "UPDATE operations SET state=?,response_json=?,updated_at=? "
+                "WHERE request_id=?",
+                (status, payload, now, request_id),
+            )
 
 
 class PinnedHostKeyPolicy(paramiko.MissingHostKeyPolicy):
