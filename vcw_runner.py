@@ -650,12 +650,16 @@ class SSHBackend:
                     self.policy.path(parent)
                     remote = self.policy.path(posixpath.join(parent, posixpath.basename(lexical)))
                     current_sha = None
+                    current_mode = None
                     try:
                         attrs = sftp.lstat(remote)
                         if stat.S_ISLNK(attrs.st_mode):
                             raise PolicyError("refusing to overwrite symlink")
+                        if not stat.S_ISREG(attrs.st_mode):
+                            raise PolicyError("refusing to overwrite non-regular file")
                         if attrs.st_size > self.cfg.max_file_bytes:
                             raise PolicyError("existing file exceeds VCW_MAX_FILE_BYTES")
+                        current_mode = stat.S_IMODE(attrs.st_mode)
                         with sftp.open(remote, "rb") as f:
                             current = f.read(self.cfg.max_file_bytes + 1)
                         if len(current) > self.cfg.max_file_bytes:
@@ -670,11 +674,17 @@ class SSHBackend:
                     if expected_sha256 is not None and current_sha != expected_sha256:
                         return {"ok": False, "code": "CAS_MISMATCH", "current_sha256": current_sha}
 
+                    desired_mode = current_mode if current_mode is not None else 0o644
                     tmp = remote + f".vcw-tmp-{uuid.uuid4().hex}"
                     try:
-                        with sftp.open(tmp, "wb") as f:
-                            f.write(data)
-                            f.flush()
+                        try:
+                            with sftp.open(tmp, "wb") as f:
+                                f.write(data)
+                                f.flush()
+                            sftp.chmod(tmp, desired_mode)
+                        except (OSError, EOFError, paramiko.SSHException) as exc:
+                            raise BackendFailure("failed to stage write before target rename") from exc
+
                         rename_attempted = True
                         try:
                             sftp.posix_rename(tmp, remote)
@@ -690,17 +700,32 @@ class SSHBackend:
                             pass
 
                     try:
+                        final_attrs = sftp.lstat(remote)
+                        if not stat.S_ISREG(final_attrs.st_mode):
+                            raise BackendUncertain("post-write target is not a regular file")
                         with sftp.open(remote, "rb") as f:
                             actual_data = f.read(self.cfg.max_file_bytes + 1)
+                    except BackendUncertain:
+                        raise
                     except Exception as exc:
                         raise BackendUncertain("write may be applied but readback failed; reconcile target file") from exc
+
                     if len(actual_data) > self.cfg.max_file_bytes:
                         raise BackendUncertain("write target exceeds verification bound after rename")
                     actual = sha256(actual_data)
                     desired = sha256(data)
+                    actual_mode = stat.S_IMODE(final_attrs.st_mode)
                     if actual != desired:
                         raise BackendUncertain("post-write SHA256 verification failed; reconcile target file")
-                    return {"ok": True, "sha256": actual, "previous_sha256": current_sha, "bytes": len(data)}
+                    if actual_mode != desired_mode:
+                        raise BackendUncertain("post-write file mode verification failed; reconcile target file")
+                    return {
+                        "ok": True,
+                        "sha256": actual,
+                        "previous_sha256": current_sha,
+                        "bytes": len(data),
+                        "mode": format(actual_mode, "04o"),
+                    }
             except socket.timeout as exc:
                 self.reset()
                 raise BackendTimeout("SFTP write timed out") from exc
