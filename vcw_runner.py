@@ -227,6 +227,7 @@ class IdempotencyLedger:
             self.target,
             connect_timeout=5,
             prepare_threshold=None,
+            autocommit=True,
         )
 
     @staticmethod
@@ -275,7 +276,7 @@ class IdempotencyLedger:
 
                 row = conn.execute(
                     "SELECT method,state,response_json,updated_at "
-                    "FROM operations WHERE request_id=%s FOR UPDATE",
+                    "FROM operations WHERE request_id=%s",
                     (request_id,),
                 ).fetchone()
                 if not row:
