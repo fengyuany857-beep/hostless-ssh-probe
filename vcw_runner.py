@@ -385,19 +385,21 @@ class IdempotencyLedger:
                 raise RuntimeError("psycopg is required for VCW_LEDGER_DATABASE_URL") from exc
             self._psycopg = psycopg
             with self._pg_connect() as conn:
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS vcw_runner_idempotency_v1 ("
-                    "request_id TEXT PRIMARY KEY,"
-                    "method TEXT NOT NULL,"
-                    "state TEXT NOT NULL,"
-                    "response_json TEXT,"
-                    "updated_at DOUBLE PRECISION NOT NULL,"
-                    "request_fingerprint TEXT,"
-                    "reconcile_json TEXT"
-                    ")"
-                )
-                conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN IF NOT EXISTS request_fingerprint TEXT")
-                conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN IF NOT EXISTS reconcile_json TEXT")
+                with conn.transaction():
+                    self._pg_set_local_limits(conn)
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS vcw_runner_idempotency_v1 ("
+                        "request_id TEXT PRIMARY KEY,"
+                        "method TEXT NOT NULL,"
+                        "state TEXT NOT NULL,"
+                        "response_json TEXT,"
+                        "updated_at DOUBLE PRECISION NOT NULL,"
+                        "request_fingerprint TEXT,"
+                        "reconcile_json TEXT"
+                        ")"
+                    )
+                    conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN IF NOT EXISTS request_fingerprint TEXT")
+                    conn.execute("ALTER TABLE vcw_runner_idempotency_v1 ADD COLUMN IF NOT EXISTS reconcile_json TEXT")
         else:
             Path(target).parent.mkdir(parents=True, exist_ok=True)
             with self._sqlite_connect() as conn:
@@ -430,9 +432,13 @@ class IdempotencyLedger:
             connect_timeout=5,
             prepare_threshold=None,
             autocommit=True,
-            options="-c lock_timeout=5000 -c statement_timeout=10000",
             application_name="vcw_remote_runner",
         )
+
+    @staticmethod
+    def _pg_set_local_limits(conn) -> None:
+        conn.execute("SET LOCAL lock_timeout = '5s'")
+        conn.execute("SET LOCAL statement_timeout = '10s'")
 
     @staticmethod
     def _record(row) -> dict[str, Any] | None:
@@ -450,11 +456,13 @@ class IdempotencyLedger:
     def get(self, request_id: str) -> dict[str, Any] | None:
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
-                row = conn.execute(
-                    "SELECT method,state,response_json,updated_at,request_fingerprint,reconcile_json "
-                    "FROM vcw_runner_idempotency_v1 WHERE request_id=%s",
-                    (request_id,),
-                ).fetchone()
+                with conn.transaction():
+                    self._pg_set_local_limits(conn)
+                    row = conn.execute(
+                        "SELECT method,state,response_json,updated_at,request_fingerprint,reconcile_json "
+                        "FROM vcw_runner_idempotency_v1 WHERE request_id=%s",
+                        (request_id,),
+                    ).fetchone()
             return self._record(row)
 
         with self.lock, self._sqlite_connect() as conn:
@@ -471,32 +479,34 @@ class IdempotencyLedger:
 
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
-                inserted = conn.execute(
-                    "INSERT INTO vcw_runner_idempotency_v1(request_id,method,state,updated_at,request_fingerprint,reconcile_json) "
-                    "VALUES(%s,%s,'RUNNING',%s,%s,%s) "
-                    "ON CONFLICT (request_id) DO NOTHING "
-                    "RETURNING request_id",
-                    (request_id, method, now, request_fingerprint, reconcile_json),
-                ).fetchone()
-                if inserted:
-                    return None
+                with conn.transaction():
+                    self._pg_set_local_limits(conn)
+                    inserted = conn.execute(
+                        "INSERT INTO vcw_runner_idempotency_v1(request_id,method,state,updated_at,request_fingerprint,reconcile_json) "
+                        "VALUES(%s,%s,'RUNNING',%s,%s,%s) "
+                        "ON CONFLICT (request_id) DO NOTHING "
+                        "RETURNING request_id",
+                        (request_id, method, now, request_fingerprint, reconcile_json),
+                    ).fetchone()
+                    if inserted:
+                        return None
 
-                row = conn.execute(
-                    "SELECT method,state,response_json,updated_at,request_fingerprint,reconcile_json "
-                    "FROM vcw_runner_idempotency_v1 WHERE request_id=%s",
-                    (request_id,),
-                ).fetchone()
-                if not row:
-                    raise RuntimeError("operation ledger conflict without visible row")
-                record = self._record(row)
-                assert record is not None
-                if record["method"] != method:
-                    raise PolicyError("request_id already used for another method")
-                if record["request_fingerprint"] is None:
-                    raise PolicyError("request_id refers to a legacy record without request fingerprint; reconcile only")
-                if record["request_fingerprint"] != request_fingerprint:
-                    raise PolicyError("request_id already used for different request parameters")
-                return record
+                    row = conn.execute(
+                        "SELECT method,state,response_json,updated_at,request_fingerprint,reconcile_json "
+                        "FROM vcw_runner_idempotency_v1 WHERE request_id=%s",
+                        (request_id,),
+                    ).fetchone()
+                    if not row:
+                        raise RuntimeError("operation ledger conflict without visible row")
+                    record = self._record(row)
+                    assert record is not None
+                    if record["method"] != method:
+                        raise PolicyError("request_id already used for another method")
+                    if record["request_fingerprint"] is None:
+                        raise PolicyError("request_id refers to a legacy record without request fingerprint; reconcile only")
+                    if record["request_fingerprint"] != request_fingerprint:
+                        raise PolicyError("request_id already used for different request parameters")
+                    return record
 
         with self.lock, self._sqlite_connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -528,13 +538,15 @@ class IdempotencyLedger:
 
         if self.backend == "postgresql":
             with self._pg_connect() as conn:
-                cur = conn.execute(
-                    "UPDATE vcw_runner_idempotency_v1 SET state=%s,response_json=%s,updated_at=%s "
-                    "WHERE request_id=%s AND state='RUNNING'",
-                    (status, payload, now, request_id),
-                )
-                if cur.rowcount != 1:
-                    raise RuntimeError("operation ledger terminal update affected no row")
+                with conn.transaction():
+                    self._pg_set_local_limits(conn)
+                    cur = conn.execute(
+                        "UPDATE vcw_runner_idempotency_v1 SET state=%s,response_json=%s,updated_at=%s "
+                        "WHERE request_id=%s AND state='RUNNING'",
+                        (status, payload, now, request_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError("operation ledger terminal update affected no row")
             return
 
         with self.lock, self._sqlite_connect() as conn:
