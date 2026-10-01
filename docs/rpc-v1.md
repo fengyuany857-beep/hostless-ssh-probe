@@ -49,7 +49,9 @@ For side-effect methods, `request_id` is bound to a canonical request fingerprin
 
 `session_id` is deliberately excluded from the action fingerprint so the same uncertain action can be reconciled/replayed across a Gateway session renewal without changing its semantic identity.
 
-Reusing a `request_id` with another method or different params is `DENIED`. A terminal cached response is replayed without repeating the side effect. Legacy ledger rows that predate fingerprints are reconcile-only and cannot be blindly replayed.
+Reusing a `request_id` with another method or different params is `DENIED`. A terminal cached response is replayed without repeating the side effect. Any existing claim without a terminal response remains `OUTCOME_UNKNOWN` and is never re-executed. Legacy ledger rows that predate fingerprints are reconcile-only and cannot be blindly replayed.
+
+Before execution, the ledger stores only a minimal reconciliation hint when one can be derived without retaining payload content: desired file SHA/path for writes/uploads, deterministic job id for start/cancel, or patch digest/touched paths. It does not store task DAGs, approval state, GPT reasoning, or file bodies.
 
 Side-effect methods are:
 
@@ -130,15 +132,16 @@ Request params:
 
 Success path:
 
-1. lexical project-root check;
+1. caller path check, including refusal of Runner/Git control metadata;
 2. canonical parent confinement;
-3. existing leaf symlink refusal;
-4. bounded current-file read and SHA256;
+3. existing leaf symlink and non-regular-file refusal;
+4. bounded current-file read, SHA256 and existing mode capture;
 5. CAS comparison;
 6. SFTP temporary write and close/flush;
-7. atomic OpenSSH `posix_rename`;
-8. target readback;
-9. final SHA256 equality check.
+7. existing mode preservation, or `0644` for a new file;
+8. atomic OpenSSH `posix_rename`;
+9. target readback;
+10. final SHA256 and mode verification.
 
 VERIFIED result includes:
 
@@ -148,7 +151,8 @@ VERIFIED result includes:
   "ok": true,
   "sha256": "new-64-hex",
   "previous_sha256": "old-64-hex-or-null",
-  "bytes": 123
+  "bytes": 123,
+  "mode": "0755"
 }
 ```
 
@@ -156,7 +160,9 @@ A stale precondition is `FAILED/CAS_MISMATCH` and does not rename the target.
 
 If rename has begun but the rename/readback/final-digest outcome cannot be proven, the request is `OUTCOME_UNKNOWN/BACKEND_OUTCOME_UNKNOWN`; reconcile the target file before retrying.
 
-Current v1 durability claim is atomic replacement plus successful remote readback. It does not claim power-loss durability equivalent to a proven remote file+directory fsync sequence.
+Current v1 durability claim is atomic replacement plus successful remote readback. Existing file mode is preserved; new files are created as `0644`. It does not claim power-loss durability equivalent to a proven remote file+directory fsync sequence.
+
+The CAS check and replace are serialized inside one Runner process. Gateway project locking and the dedicated target-account boundary remain required to prevent uncoordinated writers outside that execution path; v1 does not claim a filesystem-wide transactional CAS against hostile external writers.
 
 ### apply_patch
 
@@ -284,7 +290,9 @@ Request params:
 
 Runner verifies PID + boot ID + process start ticks before signaling the process group. It refuses to kill a process whose identity no longer matches the recorded job.
 
-A VERIFIED cancellation means the process group was no longer observed after TERM/KILL and the cancellation marker was written.
+Before signaling, Runner first observes current job state. An already SUCCEEDED/FAILED job returns `FAILED/JOB_ALREADY_TERMINAL`; an already CANCELLED job returns VERIFIED without signaling again; an uncertain identity/state returns `OUTCOME_UNKNOWN` and no signal is sent.
+
+A VERIFIED cancellation means the recorded process identity matched, the process group was no longer observed after TERM/KILL, and the cancellation marker was written. The cancellation marker is authoritative over a racing exit record.
 
 ### transfer
 
@@ -319,7 +327,7 @@ Request form for an idempotency record:
 {"kind":"request","target_request_id":"gw-01J..."}
 ```
 
-A stored terminal non-unknown result is reported as observed. A stored `OUTCOME_UNKNOWN` remains `OUTCOME_UNKNOWN`; reconciliation never upgrades it merely because a ledger row exists.
+A stored terminal non-unknown result is reported as observed. A stored `OUTCOME_UNKNOWN` remains `OUTCOME_UNKNOWN`; reconciliation never upgrades it merely because a ledger row exists. Incomplete/unknown records expose only their minimal `reconcile_hint` so the caller can issue an explicit file/job reconciliation instead of replaying the side effect.
 
 File post-condition:
 
@@ -364,6 +372,8 @@ Deployment fixes:
 - `VCW_ALLOWED_EXEC`
 - `VCW_EXEC_PATH`
 
+Caller-facing file paths cannot address `.vcw-runner` or `.git` control metadata. `TARGET_USER=root` and filesystem-root `VCW_PROJECT_ROOT=/` are rejected at startup.
+
 Caller input cannot alter these connection facts.
 
 `GET /v1/info` exposes a runtime build SHA256 fingerprint over the packaged Runner source/requirements and may expose `VCW_RUNNER_BUILD_REVISION` when the deployment supplies it. This is provenance only, not authorization.
@@ -375,3 +385,5 @@ VCW V2 Gateway owns authorization, approval, session validity/TTL, project bindi
 Execution Director/GPT owns task decomposition, diagnosis, semantic decisions, retry/backoff policy and next-step choice.
 
 Runner owns deterministic action validation, execution evidence, post-condition verification, idempotency and reconciliation only.
+
+`connection_generation` is a successful SSH connection epoch: it increments once when a new SSH connection is successfully established, not merely when a stale connection is reset.
