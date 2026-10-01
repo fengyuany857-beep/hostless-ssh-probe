@@ -1,5 +1,6 @@
 import math
 import unittest
+import vcw_runner as vr
 from types import SimpleNamespace
 
 from vcw_runner import (
@@ -275,6 +276,53 @@ class ContractTests(unittest.TestCase):
         })
         self.assertEqual(result["session_id"], "ses-new")
         self.assertEqual(cached["session_id"], "ses-old")
+
+    def test_connection_generation_tracks_successful_connection_epochs(self):
+        cfg = SimpleNamespace(
+            ssh_host_key_sha256="A" * 43,
+            target_host="example.invalid",
+            target_port=22,
+            target_user="runner",
+            ssh_private_key="key",
+            backend_timeout_s=1,
+        )
+        policy = Policy("/srv/project", frozenset(), frozenset())
+        backend = SSHBackend(cfg, policy)
+
+        class Transport:
+            def __init__(self):
+                self.active = False
+            def is_active(self):
+                return self.active
+
+        class Client:
+            def __init__(self):
+                self.transport = Transport()
+            def set_missing_host_key_policy(self, policy):
+                self.policy = policy
+            def connect(self, *args, **kwargs):
+                self.transport.active = True
+            def get_transport(self):
+                return self.transport
+            def close(self):
+                self.transport.active = False
+
+        old_client = vr.paramiko.SSHClient
+        old_loader = vr.load_private_key
+        try:
+            vr.paramiko.SSHClient = Client
+            vr.load_private_key = lambda text: object()
+            backend.connect()
+            self.assertEqual(backend.generation, 1)
+            backend.connect()
+            self.assertEqual(backend.generation, 1)
+            backend.reset()
+            self.assertEqual(backend.generation, 1)
+            backend.connect()
+            self.assertEqual(backend.generation, 2)
+        finally:
+            vr.paramiko.SSHClient = old_client
+            vr.load_private_key = old_loader
 
 
 if __name__ == "__main__":
