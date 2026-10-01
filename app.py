@@ -13,6 +13,10 @@ SERVICE = RunnerService(CFG)
 INFLIGHT = threading.BoundedSemaphore(CFG.max_inflight)
 
 
+def reject_nonstandard_json_constant(value: str):
+    raise ValueError(f"non-standard JSON constant is not allowed: {value}")
+
+
 def audit(event: str, **data):
     print(json.dumps({"event": event, "ts": time.time(), **data}, ensure_ascii=False, separators=(",", ":"), sort_keys=True), flush=True)
 
@@ -60,7 +64,7 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0 or length > CFG.max_file_bytes + 1024 * 1024:
             return self._json(413, {"ok": False, "error": "request body too large"})
         try:
-            body = json.loads(self.rfile.read(length))
+            body = json.loads(self.rfile.read(length), parse_constant=reject_nonstandard_json_constant)
         except Exception:
             return self._json(400, {"ok": False, "error": "invalid json"})
         if not isinstance(body, dict):
@@ -77,14 +81,44 @@ class Handler(BaseHTTPRequestHandler):
         started = time.time()
         try:
             response = SERVICE.dispatch(body)
-            audit("rpc.completed", request_id=rid, method=method, status=response.get("status"), duration_ms=int((time.time() - started) * 1000), connection_generation=response.get("connection_generation"))
+            audit(
+                "rpc.completed",
+                request_id=rid,
+                session_id=response.get("session_id"),
+                method=method,
+                status=response.get("status"),
+                duration_ms=int((time.time() - started) * 1000),
+                connection_generation=response.get("connection_generation"),
+            )
             return self._json(200, response)
         except PolicyError as exc:
-            audit("rpc.denied", request_id=rid, method=method, reason=str(exc))
-            return self._json(400, {"ok": False, "status": "DENIED", "error": {"code": "POLICY_DENIED", "message": str(exc)}})
+            audit("rpc.denied", request_id=rid, session_id=body.get("session_id"), method=method, reason=str(exc))
+            payload = {
+                "rpc_version": RPC_VERSION,
+                "request_id": rid if isinstance(rid, str) else "",
+                "server_id": CFG.server_id,
+                "connection_generation": SERVICE.backend.generation,
+                "status": "DENIED",
+                "result": None,
+                "error": {"code": "POLICY_DENIED", "message": str(exc)},
+            }
+            if isinstance(body.get("session_id"), str):
+                payload["session_id"] = body.get("session_id")
+            return self._json(400, payload)
         except Exception as exc:
-            audit("rpc.failed", request_id=rid, method=method, error=type(exc).__name__)
-            return self._json(500, {"ok": False, "status": "FAILED", "error": {"code": type(exc).__name__, "message": str(exc)}})
+            audit("rpc.failed", request_id=rid, session_id=body.get("session_id"), method=method, error=type(exc).__name__)
+            payload = {
+                "rpc_version": RPC_VERSION,
+                "request_id": rid if isinstance(rid, str) else "",
+                "server_id": CFG.server_id,
+                "connection_generation": SERVICE.backend.generation,
+                "status": "FAILED",
+                "result": None,
+                "error": {"code": type(exc).__name__, "message": str(exc)},
+            }
+            if isinstance(body.get("session_id"), str):
+                payload["session_id"] = body.get("session_id")
+            return self._json(500, payload)
         finally:
             INFLIGHT.release()
 
